@@ -1,6 +1,6 @@
 # Concept Material Mixer — 引き継ぎ・開発仕様
 
-Blender 用アドオン `concept_material_mixer.py`（v1.0.0、単一ファイル・約4300行）の引き継ぎ資料です。
+Blender 用アドオン `concept_material_mixer.py`（v1.1.0、単一ファイル・約5250行）の引き継ぎ資料です。
 次の作業（下の「バックログ」）を GitHub 上で Claude Code に依頼するために書いています。
 
 - 利用者：小坂さん（コンセプトアーティスト。日本語。プログラマーではない）
@@ -18,9 +18,9 @@ Blender 用アドオン `concept_material_mixer.py`（v1.0.0、単一ファイ�
 4. **ほかのアドオンのデータは変更しない**：地面ペイント（`concept_ground_paint`, `Object.cgp`, `CGP_`）、接地ブレンド（`CCB_`）、水たまり（`concept_puddle`, `CPD_`）。読むのはよい。
 5. **ユーザーの状態を勝手に変えない**：アクティブシーン、モード、選択、アクティブオブジェクト、ビューポートのシェーディング、`scene.camera`、レンダーエンジン。どうしても変える処理（編集モード・ベイク）は `_SoloActive` / `_CyclesBakeEnv` の中で行い、終わったら必ず元に戻す。
    - 注意：`context.temp_override(active_object=…)` のまま `bpy.ops.object.mode_set` を呼ぶと、**本当のアクティブオブジェクト**のモードが変わる（実際に起きた不具合）。編集モードが必要なときは `_SoloActive` を使う。
-6. **共有ノードグループの入出力を作り直さない**。`CMX_Layer::…` などのグループは複数のマテリアルで共有される。`interface.clear()` するとほかのマテリアル側のリンクが切れて、白く抜ける（実際に起きた不具合）。入出力は `_ensure_interface(g, spec)` でそろえ、中身（`g.nodes.clear()`）だけ作り直す。新しい入出力を足すときは、spec に追加すれば一度だけ作り直される。
+6. **共有ノードグループの入出力を作り直さない**。`CMX_Layer::…` などのグループは複数のマテリアルで共有される。`interface.clear()` するとほかのマテリアル側のリンクが切れて、白く抜ける（実際に起きた不具合）。入出力は `_ensure_interface(g, spec)` でそろえ、中身（`g.nodes.clear()`）だけ作り直す。新しい入出力を足すときは、**spec の最後に足す**（`_ensure_interface` は今の入出力が spec の先頭部分なら、足りない分を後ろに足すだけで、既存のつながりは切れない。v1.1 で `CMX_Layer::…` と `CMX_PlanarNormal` に `NAngle` / `NFlip` / `NFlipY` / `BumpDist` を足したが、古いファイルの別の物のマテリアルは再構築するまでそのまま動く）。途中に入れる・順番を変える・型を変えると、全部作り直しになるので避ける。
 7. **パネルの `draw()` は必ずモック検証する**（「5. テスト」を参照）。存在しないプロパティ・オペレーター・アイコンがあると、パネルが黙って壊れる。
-8. 新しいノードグループやGNを変えたときは、`*_VER` 定数（`HL_VER`, `PN_VER`, `SM_VER`）を上げる（古いファイルを開いたときに作り直されるように）。
+8. 新しいノードグループやGNを変えたときは、`*_VER` 定数（`HL_VER`, `PN_VER`, `SM_VER`, `AT_VER`）を上げる（古いファイルを開いたときに作り直されるように）。
 
 ---
 
@@ -31,7 +31,7 @@ Blender 用アドオン `concept_material_mixer.py`（v1.0.0、単一ファイ�
 | 1– | 定数 | `PAINT_UV="CMX_UV"`, `MASK_TYPES`, `MASK_DEFAULTS`, `PROJECTIONS`, `ADJ_TYPES` など |
 | 87– | small helpers | `_icon()`, `_is_mixer_material()` |
 | 107– | node copy helpers | マテリアルのノードを別ツリーへコピー（`_copy_node(s)`, `_copy_ramp`, `_copy_curves`）、ノード組み立て用 `_NB` |
-| 341– | shader node groups | `_ensure_interface`, `ensure_heightlerp`（ハイトブレンド）, `ensure_planar_normal`（投影用ノーマルマップ）, `_make_procedurals_periodic`, `build_layer_group` |
+| 341– | shader node groups | `_ensure_interface`, `ensure_heightlerp`（ハイトブレンド）, `ensure_planar_normal`（投影用ノーマルマップ）, `_make_procedurals_periodic`, `build_layer_group`, `ensure_at_*`（タイリング崩しの部品グループ） |
 | 658– | textures → material | ファイル名から種類を判別してマテリアル化（ドロップ取り込み用） |
 | 804– | surface masks | **他ツールでも使い回す部品**。エッジ・くぼみ・AOを頂点に計算するGN `CMX_SurfaceMasks`、`ensure_mask_modifier`、`_CyclesBakeEnv`、`_TempBakeNodes`、`bake_surface_masks` |
 | 1195– | paint UV | `ensure_paint_uv`（Smart UV で `CMX_UV`）, `_SoloActive` |
@@ -40,7 +40,7 @@ Blender 用アドオン `concept_material_mixer.py`（v1.0.0、単一ファイ�
 | 1657– | tiling material | `create_tile_object`（継ぎ目なしタイル素材用の平面） |
 | 1684– | ground paint import | 地面ペイントのレイヤーと塗りを取り込む |
 | 1787– | paint images | 塗り画像の作成・塗りつぶし |
-| 1903– | material builder | `_Shared`, `_mask_value`, `_auto_mask`, `_paint_mix`, `_material_sockets`, `rebuild_material`（**中心**） |
+| 1903– | material builder | `_Shared`, `_mask_value`, `_auto_mask`, `_paint_mix`, `_Place`（配置）, `_anti_tile`（タイリング崩し）, `_material_sockets`, `rebuild_material`（**中心**） |
 | 2406– | light display | 塗っている間の簡易表示・サブディビジョン一時低下・終了監視タイマー |
 | 2483– | property callbacks | ノード名でライブ更新（再構築なし）か、`rebuild_material` |
 | 2800– | properties | `CMX_Mask`, `CMX_Layer`, `CMX_MatRef`, `CMX_Settings` |
@@ -104,56 +104,53 @@ Blender 用アドオン `concept_material_mixer.py`（v1.0.0、単一ファイ�
 
 ---
 
+### 3.9 配置（Placement）と向きの補正（v1.1）
+- 平面の座標 p=(u, v) → テクスチャ座標 `t = S · R(−θ) · p + o`（`_Place`）。S = (繰り返しX, 繰り返しY)、θ = 回転、o = ずらし。トリプラナーは平面ごと（X面=(y,z)、Y面=(x,z)、Z面=(x,y)）、UV・真上は1つの平面で同じ式を使う。「そのまま」投影には効かない。
+- 値は Value ノード（`L{i}_pl_rot` / `_pl_x` / `_pl_y` / `_pl_sx` / `_pl_sy` / `_nfy`）なので、スライダーでは再コンパイルしない。タイル素材だけは整数回くり返しが要るので、変更のたびに作り直す（回転は 90° の倍数にそろえる）。
+- **ノーマルの向き**：テクスチャを回す・反転すると、接空間ノーマルの XY も `R(θ)·diag(反転, DirectX用の上下反転)` で回す必要がある（Blender 標準の Normal Map ノードは物の UV の接線を使うため、そのままでは回らない）。`build_layer_group` に入力 `NAngle`（回転角）/ `NFlip`（左右反転 ±1）/ `NFlipY`（上下反転 ±1）を持たせ、グループの中で
+  - UV・タイル素材モード：ノーマルマップの色をデコード → 回す・反転 → エンコードしてから Normal Map ノードに入れる（`_xform_normal_maps`）
+  - 投影モード：`CMX_PlanarNormal` が XY を回してから面の u/v 方向に割り当てる（`_xform_tangent_vec`）
+  で補正する。補正はベクトルのノードだけで組む（スカラーのノードを並べると Cycles のスタックを食う）。X/Y の繰り返し倍率（非等方）の分は補正していない（凹凸の傾きは等方のまま）。
+- `normal_flip_y`（DirectX 形式）も同じ行列の一部。
+
+### 3.10 タイリング崩し（ランダムシート）（v1.1）
+- レイヤーの `anti_tile`。画像テクスチャを含む素材だけに効く（プロシージャルだけの素材は無視）。簡易表示（塗り中）では使わない。
+- セルの格子：`_lattice_square`（四角。まわりの4セル、セルの中心が格子点）/ `_lattice_hex`（六角形。三角格子の3頂点、Mikkelsen の hex-tiling の考え方）。共有グループ `CMX_ATLattice_SQ` / `_HX`。
+- セルごとの乱数（`CMX_ATVertex`）：ホワイトノイズ（格子の番号＋シード）→ ずらし・回転（なし／90°刻み／自由）・左右反転。座標とノーマル補正の角度（`NAngle` = レイヤーの回転 + セルの回転）、`NFlip` を返す。
+- 混ぜ方（`CMX_ATAccum`、サンプルを1つずつ足し込む）：重み = `(セルの重み)^べき乗 × exp(3 × ハイト)`（`at_mix` = ハイト）。べき乗は `1 + 15 (1 − 境目の幅)²`。`at_mix` = ノイズのときは、重みに共有ノイズを足してから、ハイトの項なし。最後に重みの合計で割る。
+- タイル素材：セル数を整数（`at_cell` ÷ 繰り返し）にして、セル番号をタイルの周期で巻き戻す（六角形は、格子の周期ベクトル (−b/2, b) に合わせて巻き戻す）。回転が「自由」でも 90° 刻みにする（そうしないと端で継ぎ目が出る）。
+- 全体の「大きなムラ」（`macro_amount`, `macro_scale`）：最終の Color / Roughness に、低周波ノイズで明るさ・色相・ラフネスを少し足す（`_macro_variation`）。0 なら何も作らない。
+- **重さと Cycles の限界**：1つのセルにつき素材のグループを1回読むので、トリプラナーで 3面 × (六角形3 / 四角4) 回読む。EEVEE では問題ないが、**Cycles の SVM スタック（255 スロット）が足りなくなり「shader too big」エラー（焼き込みが黒や平らになる）になることがある**。目安：読み込みの合計がおよそ 21 回まで（六角形・トリプラナーなら 2〜3 レイヤー、四角・トリプラナーなら 1 レイヤー）。パネルは `AT_SAMPLE_WARN`(18) を超えると警告を出し、`bake_textures` はベースカラーが真っ黒／ノーマルが真っ平らなら失敗として止める（`_is_blank`, `_heavy_shader`）。全体の凹凸（Bump）は上流を3回評価するので、重い構成と組み合わせると同じ限界に当たりやすい。
+
+### 3.11 凹凸（ノーマル・ハイト）（v1.1）
+- レイヤーごと：
+  - `normal_strength`：Blender の Normal Map の Strength と同じ式 `normalize(N0 + (N − N0)·k)`（N0 = 面の法線）。レイヤーのグループの外で掛ける（`_normal_strength`）。
+  - `normal_from_height`：素材のハイトから Bump ノードで凹凸を作って足す。これは別バージョンのグループ（`CMX_Layer::…+B`、入力 `BumpDist` = テクスチャ1枚の大きさの 5% × `height_strength_layer`）。Bump は上流を3回評価するので、オンのときだけ作る。
+  - `height_invert`：ブレンド用のハイトと凹凸の高さを反転。`height_contrast` / `height_offset` はこの後に掛かる（既存の挙動）。
+  - `height_strength_layer`：**凹凸の高さ**（`relief`）の強さ。`relief = (ハイト − 0.5)·強さ + 0.5`。ブレンドの勝ち負けには使わない。1 で今まで通り。
+  - `stack_mode`（標準／上から積もる／下から出る）+ `stack_amount`：ブレンドに渡す「このレイヤーのハイト」を、下のレイヤーのハイトに応じて偏らせる（`clamp(h + 量·(0.5 − 下のハイト))`、クランプするので `CMX_HeightLerp` の保証は崩れない）。
+  - `wrap_amount`（下の形に沿わせる）：このレイヤーのノーマルに `量·(下のノーマル − 面の法線)`、relief に `量·(下の relief − 0.5)` を足す。「下の凹凸をぼかす」（Blur Underlying）は**未実装**（シェーダーでは低周波成分が取れないため）。
+- 凹凸の高さ `relief` は、HeightLerp と同じ Factor で混ぜながら別に持ち回る（`prev["Relief"]`）。濡れ調整は relief も平らにする。最後の `OUT_Height`（焼き込みのハイト）は relief（強さ 1・重ね方の設定なしなら、今までのハイトと同じ）。
+- 全体：`bump_strength`（0 でなし。>0 で `G_bump` の Bump ノードを作り、最終の relief から最終のノーマルへ重ねる）、`bump_distance`。ノーマルの焼き込みにも入る。
+- 形を動かす：`cmx.displace_add`（焼いたハイトの画像 `CMX_<物名>_Height` を使う Displace モディファイア `CMX_Displace`、強さ `disp_strength`・中心値 `disp_mid`、ライブ更新）。`cmx.displace_remove` で外す。焼き込み中（`_CyclesBakeEnv`）は一時的に無効になる。マテリアルのディスプレイスメント（`displacement_method`）は未対応。
+- 細かい凹凸／大きい凹凸の分離は、ノーマル（`normal_strength`）とハイト（`height_strength_layer`）の強さを別々に持つ近似にした。
+
 ## 4. バックログ（次にやること）
 
-ユーザー確認済みの優先順：**4.1 → 4.2 → 4.3** を最初のまとまりとして実装する。それ以降は「4.4 その他」から順に。
+**4.1〜4.3 は v1.1.0 で実装済み**（設計と実装メモは「3.9〜3.11」）。以下は、依頼時の内容と、実装での違い・残りです。
 
-### 4.1 タイリング感をなくす「ランダムシート」（フィードバック①）
-目的：同じテクスチャの繰り返しが目立たないようにする。Quixel Mixer には無い機能。
+### 4.1 タイリング感をなくす「ランダムシート」（実装済み）
+- レイヤーの `anti_tile` / `at_cell` / `at_shape`（既定は六角形。軽いので）/ `at_rot` / `at_flip` / `at_offset` / `at_blend` / `at_mix`（ハイトで混ぜる／ノイズで崩す）/ `at_seed`。パネル「タイリング崩し」。全体の「大きなムラ」は `macro_amount` / `macro_scale`（パネル「全体の凹凸・ムラ」）。
+- 違い：回転は、タイル素材では「自由」でも 90° 刻みになる。混ぜ方のハイトの重みは `CMX_HeightLerp` そのものではなく、`exp(3·ハイト)` の重み付き平均。
+- 制限：Cycles の限界（3.10）。
 
-- レイヤーごとの設定（パネル「レイヤー」内の折りたたみ「タイリング崩し」）：
-  - `anti_tile`（使う/使わない）
-  - `at_cell`：セルの大きさ（タイル何枚分か。既定 1.0）
-  - `at_shape`：四角 / 六角形
-  - `at_rot`：回転なし / 90°刻み / 自由
-  - `at_flip`：左右反転も混ぜる
-  - `at_offset`：位置ずらしの量（0〜1）
-  - `at_blend`：セルの境目の幅（0〜1）。境目はレイヤーのハイトで混ぜる（`CMX_HeightLerp` と同じ考え方）か、ノイズで崩す
-  - `at_seed`
-- 実装方針：
-  - セル ID はボロノイ（Cell ID を Color 出力から得る）または `floor()` で作り、セルごとの乱数で UV のずらし・回転・反転を決める。
-  - 隣のセルとの境目だけ2〜3回サンプルして混ぜる（ヘックスタイリング / テクスチャボミングの考え方）。
-  - **ノーマルマップの向き**：UV を回転・反転したら、ノーマルの XY も同じだけ回す・反転する。`CMX_PlanarNormal` と同様、ノーマルマップノードを置き換える方式で実装する。
-  - 対応する投影：UV・真上・トリプラナー（トリプラナーは平面ごとに適用）。タイル素材モードでは、セルがタイルの端で継ぎ目なくつながるよう、セル数を整数にしてセル ID を wrap する。
-  - 重さ：簡易表示（塗り中）では無効にする。
-- 全体の設定「大きなムラ」：数 m 単位のノイズで、最終の明るさ・色相・ラフネスをわずかに揺らす（`macro_amount`, `macro_scale`）。軽く、効果が大きい。
-- 受け入れ条件：
-  - 4×4 以上の繰り返しで、格子状の繰り返しが目で追えないこと。
-  - 回転したセルで、光の当たり方（ノーマル）が破綻しないこと。セル境目の左右で陰影が反転しないこと。
-  - タイル素材モードで焼いたとき、端と端の差が隣接ピクセルの差と同程度であること（既存の継ぎ目テストと同じ方法）。
+### 4.2 ハイトで凹凸感を出す（実装済み）
+- レイヤーごとの強さ・反転・DirectX・ハイトからの凹凸、全体の凹凸、重ね方（上から積もる／下から出る／下の形に沿わせる）、Displace モディファイア。パネル「凹凸（ノーマル・ハイト）」「全体の凹凸・ムラ」。
+- 未実装：Blur Underlying、マテリアルのディスプレイスメント（`displacement_method`）。
+- 既存ファイルの見た目は変わらない（強さ 1・全体の凹凸 0・大きなムラ 0 が既定。古い実装と同じ設定でレンダリングし、Color / Roughness / Metallic / Normal / Height が一致することを確認済み）。
 
-### 4.2 ハイトで凹凸感を出す（フィードバック②）
-今のハイトはレイヤー境界の判定にしか使っておらず、見た目の凹凸は素材のノーマルだけに頼っている。
-
-- レイヤーごと：
-  - `normal_strength`（ノーマルの強さ。0〜2）
-  - `height_strength_layer`（このレイヤーのハイトの強さ）
-  - `height_invert`
-  - `normal_flip_y`（DirectX 形式の素材用）
-  - `normal_from_height`（ノーマルマップのない素材に、ハイトからノーマルを作る。Bump ノード）
-  - 「細かい凹凸 / 大きい凹凸」の強さを分ける（Mixer の Height Frequency）。シェーダーでは、ハイトの低周波成分を得るのが難しい。そのため、焼き込み時に分けるか、素材の Bump / ノーマルの強さと Displacement の強さを別々に掛ける近似でよい。
-- 全体：
-  - `global_bump`：最終 `OUT_Height` から Bump を作り、最終ノーマルに重ねる（例：苔が岩の上に盛り上がって見える）。強さと距離。
-  - 重ね方の追加：「上から積もる / 下から出る」（Mixer の Invert）、「下の形に沿わせる量」（Wrap to Underlying）、「下の凹凸をぼかす」（Blur Underlying。近似でよい）。
-  - 本当に形を動かす：焼いたハイトを使い、Cycles のマテリアルディスプレイスメント（`displacement_method`）または `Displace` モディファイア（`CMX_Displace`）を付けるボタン。強さ・中心値を調整でき、外すこともできる。
-- 受け入れ条件：
-  - 強さ0で今と同じ見た目になること（既存のファイルが変わらない）。
-  - 焼き込みの Normal / Height にも反映されること。
-
-### 4.3 配置（Placement）
-- レイヤーごとに：位置ずらし X/Y、回転（自由角度。UV では 90° 刻みも選べる）、X/Y 別々の繰り返し（またはタイルサイズ）。
-- トリプラナー・真上・UV・タイル素材の全モードで効くこと。回転したときはノーマルの向きも直すこと（4.1 と同じ処理を共通化する）。
-- ライブ更新（Value ノード）にして、スライダー操作で再コンパイルしないこと。
+### 4.3 配置（Placement）（実装済み）
+- レイヤーごとに `place_x` / `place_y`（ずらし）、`place_rot`（回転。`place_snap` で 90° 刻み）、`place_sx` / `place_sy`（X/Y の繰り返し倍率）。パネル「配置」。トリプラナー・真上・UV・タイル素材で効く（「そのまま」には効かない）。ライブ更新。回転・反転に合わせてノーマルの向きも補正（3.9）。
 
 ### 4.4 その他（Quixel Mixer にあって、まだ無いもの）
 優先度・高
@@ -236,6 +233,16 @@ with bpy.context.temp_override(active_object=obj, object=obj, selected_objects=[
             P.draw(types.SimpleNamespace(layout=L()), bpy.context)
 ```
 
+### 5.2.1 bpy を pip で入れたヘッドレス検証（v1.1 で使った方法）
+- `python -m venv v && v/bin/pip install bpy`（Python 3.13 に Blender 5.1 が入る。EEVEE は使えないが、Cycles（CPU）でレンダリング・焼き込みできる）。5.x では `Material.use_nodes` が非推奨の警告を出すが動く。
+- ミキサーのマテリアルを組み立てたあと、`OUT_Color` / `OUT_Normal` などの Reroute を Emission につないで平らな板を真上から Cycles でレンダリングし、EXR を読むと、出口の値を画素単位で比べられる。これで次を確認した：
+  - 古い実装と新しい実装で、既定の設定のとき Color / Roughness / Metallic / Normal / Height が一致する（最大差 1e-7）。
+  - 回転・ずらし・DirectX 反転でのノーマルの向きが、変形後のハイトから計算した本当の法線と一致する（UV・真上・トリプラナーのX/Y/Z面、誤差 3e-4）。
+  - タイル素材（回転・X/Y繰り返し・タイリング崩し・大きなムラ）の継ぎ目：折り返しの差が、まわりの隣り合うピクセルの差と同程度。
+  - スライダーでのライブ更新の結果が、作り直した結果と一致し、再構築が走らない。
+- 注意：bpy 5.x では、画像の `colorspace_settings.name` を変えると `pixels` が 0 に戻る。先に色空間を設定してから `pixels.foreach_set` で入れる。
+- 注意：Cycles の「shader too big」（SVM スタック不足）は、ログに出るだけで例外にならず、黒や平らに焼けて終わる。重い構成を足したときは、`render` のログを確認する。
+
 ### 5.3 見た目の確認
 シェーダーの見た目は、最終的にユーザーの Blender（EEVEE）で確認する。PR の説明には、次の2つを書く。
 - 何をどう確認したか
@@ -248,6 +255,8 @@ with bpy.context.temp_override(active_object=obj, object=obj, selected_objects=[
 - 画像テクスチャ以外のプロシージャル（Wave・Magic など）は、タイル素材モードで継ぎ目が出ることがある（ノイズ・ボロノイのみ自動変換）。
 - 塗りは `CMX_UV` を使うため、UV 島の境目をまたぐストロークは途切れることがある。
 - 1つの物に1つのミキサーマテリアル（全スロット共通）。部品ごとの塗り分けは 4.4-1 で対応予定。
+- タイリング崩し・全体の凹凸は Cycles（焼き込み）のシェーダーの大きさの限界に当たりやすい（3.10）。EEVEE の表示は問題ない。
+- タイリング崩しは、画像テクスチャを含まない素材（プロシージャルだけ）には効かない。X/Y の繰り返し倍率が違うときの凹凸の傾きは、等方のまま（厳密ではない）。
 - スマートマテリアルのマテリアル照合は「同じ名前なら同じもの」とみなす。
 
 ## 7. 将来の利用予定（設計上の配慮）

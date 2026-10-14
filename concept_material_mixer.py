@@ -1,7 +1,7 @@
 bl_info = {
     "name": "Concept Material Mixer",
     "author": "Claude",
-    "version": (1, 0, 0),
+    "version": (1, 1, 0),
     "blender": (4, 2, 0),
     "location": "3D View > Sidebar > Concept",
     "description": "Quixel Mixerのように、マテリアルをレイヤーで重ね、自動マスク＋塗りで塗り分ける",
@@ -20,10 +20,11 @@ from bpy.props import (StringProperty, FloatProperty, IntProperty, BoolProperty,
 from bpy.app.handlers import persistent
 
 PAINT_UV = "CMX_UV"                  # 塗り・マスク焼き込み用のUV（自動で作る）
+DISP_MOD = "CMX_Displace"            # 焼いたハイトで形を動かすモディファイア
 HL_NAME = "CMX_HeightLerp"
 HL_VER = 2
 PN_NAME = "CMX_PlanarNormal"
-PN_VER = 1
+PN_VER = 2
 SM_GROUP = "CMX_SurfaceMasks"        # エッジ・くぼみ・AO を頂点に計算するジオメトリノード
 SM_VER = 2
 SM_ATTR = "CMX_Masks"                # R = エッジ, G = くぼみ, B = AO（1 = 遮蔽なし）
@@ -339,16 +340,39 @@ class _NB:
 
 
 # ------------------------------------------------------------------ shader node groups
-def _ensure_interface(g, spec):
+def _ensure_interface(g, spec, defaults=None):
     """グループの入出力を spec [(名前, 'INPUT'/'OUTPUT', 型)] にそろえる。
-    すでに同じなら何もしない。作り直すと、そのグループを使う「ほかの」マテリアルのつながりが切れてしまうため。"""
+    すでに同じなら何もしない。今の入出力が spec の「先頭部分」なら、足りない分を後ろに足すだけ
+    （既存のつながりは切れない）。それ以外のときだけ作り直す。作り直すと、そのグループを使う
+    「ほかの」マテリアルのつながりが切れてしまうため、入出力を増やすときは spec の最後に足すこと。
+    defaults = {名前: 初期値}（新しく作った入力に設定する）"""
     cur = [(it.name, it.in_out, it.socket_type) for it in g.interface.items_tree if it.item_type == 'SOCKET']
+    want = [tuple(x) for x in spec]
     # 並び順は入力・出力それぞれの中だけ比べる（Blender は出力を先に並べるため）
-    if all([c for c in cur if c[1] == io] == [tuple(x) for x in spec if x[1] == io] for io in ('INPUT', 'OUTPUT')):
+    same = True
+    prefix = True
+    for io in ('INPUT', 'OUTPUT'):
+        c = [x for x in cur if x[1] == io]
+        w = [x for x in want if x[1] == io]
+        if c != w:
+            same = False
+        if c != w[:len(c)]:
+            prefix = False
+    if same:
         return False
-    g.interface.clear()
-    for name, io, st in spec:
-        g.interface.new_socket(name=name, in_out=io, socket_type=st)
+    if not prefix:
+        g.interface.clear()
+        cur = []
+    have = {(x[0], x[1]) for x in cur}
+    for name, io, st in want:
+        if (name, io) in have:
+            continue
+        it = g.interface.new_socket(name=name, in_out=io, socket_type=st)
+        if defaults and name in defaults and io == 'INPUT':
+            try:
+                it.default_value = defaults[name]
+            except Exception:
+                pass
     return True
 
 
@@ -422,10 +446,25 @@ def ensure_heightlerp():
     return g
 
 
+def _xform_tangent_vec(nb, v, ang, flip, fy):
+    """接空間ノーマル（-1〜1 のベクトル）の XY を、R(ang)·diag(flip, fy) で回す・反転する（Z はそのまま）。
+    配置（回転・左右反転・DirectX 形式の上下反転）でテクスチャの向きを変えたとき、凹凸の向きを合わせるために使う。
+    ang = 回転角（ラジアン）、flip = 左右反転（±1）、fy = 上下反転（±1）。
+    ベクトルのノードだけで組む（スカラーのノードを並べると Cycles のスタックを食うため）。"""
+    m = nb.vmath('MULTIPLY', v, nb.comb_xyz(flip, fy, 1.0))
+    rot = nb.node("ShaderNodeVectorRotate")
+    rot.hide = True
+    rot.rotation_type = 'Z_AXIS'
+    nb.link(m, rot.inputs["Vector"])
+    nb.link(ang, rot.inputs["Angle"])
+    return rot.outputs["Vector"]
+
+
 def ensure_planar_normal():
     """投影座標（トリプラナー・真上）用のノーマルマップ。
     Plane 0 = X面 (u=Y, v=Z), 1 = Y面 (u=X, v=Z), 2 = Z面 (u=X, v=Y)。
-    接線 = 投影のu/v方向なので、裏側の面（鏡像）でも正しい向きになる。"""
+    接線 = 投影のu/v方向なので、裏側の面（鏡像）でも正しい向きになる。
+    NAngle / NFlip / NFlipY = 接空間ノーマルの XY の回転角・左右反転・上下反転（配置用。初期値は何もしない）。"""
     g = bpy.data.node_groups.get(PN_NAME)
     if g is not None and g.get("cmx_ver") == PN_VER:
         return g
@@ -434,7 +473,10 @@ def ensure_planar_normal():
     g.nodes.clear()
     g["cmx_ver"] = PN_VER
     _ensure_interface(g, [("Strength", 'INPUT', "NodeSocketFloat"), ("Color", 'INPUT', "NodeSocketColor"),
-                          ("Plane", 'INPUT', "NodeSocketFloat"), ("Normal", 'OUTPUT', "NodeSocketVector")])
+                          ("Plane", 'INPUT', "NodeSocketFloat"), ("Normal", 'OUTPUT', "NodeSocketVector"),
+                          ("NAngle", 'INPUT', "NodeSocketFloat"), ("NFlip", 'INPUT', "NodeSocketFloat"),
+                          ("NFlipY", 'INPUT', "NodeSocketFloat")],
+                      defaults={"NAngle": 0.0, "NFlip": 1.0, "NFlipY": 1.0})
     _iface_socket(g, "Strength").default_value = 1.0
     _iface_socket(g, "Color").default_value = (0.5, 0.5, 1.0, 1.0)
     nb = _NB(g)
@@ -446,6 +488,8 @@ def ensure_planar_normal():
     sx = nb.sep_xyz(t)
     tx = nb.math('MULTIPLY', sx[0], gi.outputs["Strength"])
     ty = nb.math('MULTIPLY', sx[1], gi.outputs["Strength"])
+    tv = _xform_tangent_vec(nb, nb.comb_xyz(tx, ty, 0.0), gi.outputs["NAngle"], gi.outputs["NFlip"], gi.outputs["NFlipY"])
+    tx, ty, _tz = nb.sep_xyz(tv)
     is1 = nb.math('GREATER_THAN', gi.outputs["Plane"], 0.5)
     is2 = nb.math('GREATER_THAN', gi.outputs["Plane"], 1.5)
     ox = nb.math('MULTIPLY', tx, is1)
@@ -463,7 +507,7 @@ def ensure_planar_normal():
     return g
 
 
-def _replace_normal_maps(N, L, plane_sock):
+def _replace_normal_maps(N, L, plane_sock, xf):
     """接空間ノーマルマップを、投影座標で正しく働く CMX_PlanarNormal に置き換える。"""
     pn = ensure_planar_normal()
     repl = {}
@@ -483,11 +527,34 @@ def _replace_normal_maps(N, L, plane_sock):
                 v = si.default_value
                 g.inputs[nm].default_value = tuple(v) if nm == "Color" else v
         L.new(plane_sock, g.inputs["Plane"])
+        for nm, sk in zip(("NAngle", "NFlip", "NFlipY"), xf):
+            L.new(sk, g.inputs[nm])
         for lk in list(n.outputs["Normal"].links):
             L.new(g.outputs["Normal"], lk.to_socket)
         repl[n.name] = g
         N.remove(n)
     return repl
+
+
+def _xform_normal_maps(g, xf):
+    """UV・タイル素材モード用：ノーマルマップの色（接空間）の XY に行列を掛けてから入れる。"""
+    N, L = g.nodes, g.links
+    nb = _NB(g)
+    for n in list(N):
+        if n.type != 'NORMAL_MAP' or n.space != 'TANGENT':
+            continue
+        nb.x, nb.y = n.location.x - 700, n.location.y
+        si = n.inputs["Color"]
+        fs = _src(si)
+        if fs is None:
+            rgb = N.new("ShaderNodeRGB")
+            rgb.outputs[0].default_value = tuple(si.default_value)
+            fs = rgb.outputs[0]
+        t = nb.vmath('MULTIPLY_ADD', fs, (2.0, 2.0, 2.0))
+        t.node.inputs[2].default_value = (-1.0, -1.0, -1.0)
+        enc = nb.vmath('MULTIPLY_ADD', _xform_tangent_vec(nb, t, *xf), (0.5, 0.5, 0.5))
+        enc.node.inputs[2].default_value = (0.5, 0.5, 0.5)
+        L.new(enc, si)
 
 
 def _has_images(mat):
@@ -528,19 +595,28 @@ def _make_procedurals_periodic(N, L, gi):
         L.new(w, n.inputs["W"])
 
 
-def build_layer_group(mat, mode, uv_name=""):
+def build_layer_group(mat, mode, uv_name="", bump=False):
     """マテリアルをノードグループに写す。
     mode: 'O' そのまま / 'U' UV（uv_name のUVで、ベクトル入力に差し替え） / 'P' 投影（トリプラナー・真上）
-          'T' タイル素材（UV＋ノイズ・ボロノイを4Dドーナツ座標にして継ぎ目なし）"""
+          'T' タイル素材（UV＋ノイズ・ボロノイを4Dドーナツ座標にして継ぎ目なし）
+    bump: True なら、素材のハイトから Bump ノードで凹凸（法線）を作って足す（ノーマルマップのない素材用）
+    入力 NAngle / NFlip / NFlipY = ノーマルマップの XY の回転角・左右反転・上下反転（配置用。初期値は何もしない）
+    入力 BumpDist = bump のときの凹凸の高さ (m)"""
     key = mode if mode != 'U' else "U:" + uv_name
+    if bump:
+        key += "+B"
     gname = "CMX_Layer::%s::%s" % (mat.name, key)
     g = bpy.data.node_groups.get(gname)
     if g is None:
         g = bpy.data.node_groups.new(gname, "ShaderNodeTree")
     g.nodes.clear()
+    # 入出力を増やすときは、必ず最後に足す（_ensure_interface は足りない分だけ足すので、既存のつながりが切れない）
     _ensure_interface(g, [("Vector", 'INPUT', 'NodeSocketVector'), ("Plane", 'INPUT', 'NodeSocketFloat'),
                           ("TorusXYZ", 'INPUT', 'NodeSocketVector'), ("TorusW", 'INPUT', 'NodeSocketFloat')] +
-                      [(k, 'OUTPUT', SOCK_TYPES[k]) for k in KEYS])
+                      [(k, 'OUTPUT', SOCK_TYPES[k]) for k in KEYS] +
+                      [("NAngle", 'INPUT', 'NodeSocketFloat'), ("NFlip", 'INPUT', 'NodeSocketFloat'),
+                       ("NFlipY", 'INPUT', 'NodeSocketFloat'), ("BumpDist", 'INPUT', 'NodeSocketFloat')],
+                      defaults={"NAngle": 0.0, "NFlip": 1.0, "NFlipY": 1.0, "BumpDist": 0.02})
     N, L = g.nodes, g.links
     gi = N.new("NodeGroupInput"); gi.location = (-2400, 0)
     go = N.new("NodeGroupOutput"); go.location = (900, 0)
@@ -576,8 +652,10 @@ def build_layer_group(mat, mode, uv_name=""):
             for n in N:
                 if n.type == 'NORMAL_MAP':
                     n.uv_map = uv_name
+            _xform_normal_maps(g, (gi.outputs["NAngle"], gi.outputs["NFlip"], gi.outputs["NFlipY"]))
         elif mode == 'P':
-            repl = _replace_normal_maps(N, L, gi.outputs["Plane"])
+            repl = _replace_normal_maps(N, L, gi.outputs["Plane"],
+                                        (gi.outputs["NAngle"], gi.outputs["NFlip"], gi.outputs["NFlipY"]))
         if mode == 'T':
             _make_procedurals_periodic(N, L, gi)
 
@@ -640,17 +718,24 @@ def build_layer_group(mat, mode, uv_name=""):
             vn = N.new("ShaderNodeValue"); vn.outputs[0].default_value = v
             v = vn.outputs[0]
         L.new(v, go.inputs[k])
-    v = vals["Normal"]
-    if v is None:
-        v = N.new("ShaderNodeNewGeometry").outputs["Normal"]
-    L.new(v, go.inputs["Normal"])
-    v = vals["Height"]
-    if v is None:
+    hv = vals["Height"]
+    if hv is None:
         bw = N.new("ShaderNodeRGBToBW"); L.new(color_sock, bw.inputs[0])
         pw = N.new("ShaderNodeMath"); pw.operation = 'POWER'; pw.inputs[1].default_value = 0.4545
         L.new(bw.outputs[0], pw.inputs[0])
-        v = pw.outputs[0]
-    L.new(v, go.inputs["Height"])
+        hv = pw.outputs[0]
+    L.new(hv, go.inputs["Height"])
+    v = vals["Normal"]
+    if v is None:
+        v = N.new("ShaderNodeNewGeometry").outputs["Normal"]
+    if bump:
+        bn = N.new("ShaderNodeBump"); bn.location = (700, -300)
+        bn.inputs["Strength"].default_value = 1.0
+        L.new(gi.outputs["BumpDist"], bn.inputs["Distance"])
+        L.new(hv, bn.inputs["Height"])
+        L.new(v, bn.inputs["Normal"])
+        v = bn.outputs["Normal"]
+    L.new(v, go.inputs["Normal"])
     g["cmx_src"] = mat.name
     return g
 
@@ -969,9 +1054,9 @@ class _CyclesBakeEnv:
 
     def __enter__(self):
         sc = self.ctx.scene
-        # 3×3の確認用の並びは焼き込みに入れない
+        # 3×3の確認用の並びと、ハイトで動かした形は焼き込みに入れない
         self.preview = []
-        for nm in ("CMX_TilePreview_X", "CMX_TilePreview_Y"):
+        for nm in ("CMX_TilePreview_X", "CMX_TilePreview_Y", DISP_MOD):
             md = self.obj.modifiers.get(nm)
             if md is not None:
                 self.preview.append((md, md.show_viewport, md.show_render))
@@ -1344,6 +1429,17 @@ def _bake_target(name, res, srgb=False, float_buffer=False):
     return img
 
 
+def _is_blank(img, flat=False):
+    """焼いた画像がまっ黒（0）か（flat=True なら、全部同じ色か）。シェーダーが Cycles に大きすぎると、
+    エラーのまま黒や平らなノーマルに焼けてしまうので、その検出に使う。"""
+    px = np.empty(len(img.pixels), dtype=np.float32)
+    img.pixels.foreach_get(px)
+    rgb = px.reshape(-1, 4)[:, :3]
+    if flat:
+        return float(rgb.std(axis=0).max()) < 1e-5
+    return float(rgb.max()) < 1e-6
+
+
 def bake_textures(context, obj, res=2048, uv_name=PAINT_UV, channels=None, samples=4, ao_samples=16,
                   ao_distance=0.3, ao_others=False):
     """ミキサーの仕上がりを Cycles でテクスチャに焼く。{key: image} を返す（保存はしない）。"""
@@ -1404,6 +1500,10 @@ def bake_textures(context, obj, res=2048, uv_name=PAINT_UV, channels=None, sampl
                     if btype == 'NORMAL':
                         kw["normal_space"] = 'TANGENT'
                     env.bake(**kw)
+                if (key == 'COLOR' and _is_blank(img)) or \
+                        (key == 'NORMAL' and _heavy_shader(s) and _is_blank(img, flat=True)):
+                    raise RuntimeError("Cycles でシェーダーが大きすぎて焼けませんでした。タイリング崩し・全体の凹凸・"
+                                       "トリプラナーのレイヤーを減らしてみてください（焼き込み以外の表示は問題ありません）")
                 images[key] = img
     finally:
         if prev_active and uvs.get(prev_active) is not None:
@@ -1573,7 +1673,9 @@ def save_smart(obj, name):
     d = smart_dir()
     data = {"version": SMART_VER, "name": name, "source_object": obj.name,
             "layers": [pg_to_dict(l) for l in s.layers],
-            "settings": {"height_strength": s.height_strength, "mask_source": s.mask_source}}
+            "settings": {"height_strength": s.height_strength, "mask_source": s.mask_source,
+                         "macro_amount": s.macro_amount, "macro_scale": s.macro_scale,
+                         "bump_strength": s.bump_strength, "bump_distance": s.bump_distance}}
     mats = {l.material for l in s.layers if l.material is not None}
     with open(os.path.join(d, name + ".json"), "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=1)
@@ -1627,6 +1729,9 @@ def apply_smart(context, obj, data, keep_base=False):
         st = data.get("settings", {})
         if "height_strength" in st:
             s.height_strength = st["height_strength"]
+        for k in ("macro_amount", "macro_scale", "bump_strength", "bump_distance"):
+            if k in st:
+                setattr(s, k, st[k])
         s.active_index = len(s.layers) - 1
         s.use_baked = False
         s.view_mode = 'NORMAL'
@@ -1953,6 +2058,21 @@ class _Shared:
         xyz, w = self._torus
         return nb.vmath('SCALE', xyz, scale=radius), nb.math('MULTIPLY', w, radius)
 
+    def torus2(self, rx, ry, ua, va):
+        """torus() の一般形：u・v それぞれの周期（座標 ua, va は1周で1.0増える）と半径 rx, ry を別々に指定する。
+        タイル素材で、回転・ずらし・X/Y別々の繰り返しを入れたあとも継ぎ目なしにするために使う。"""
+        nb = self.nb
+        x, y = nb.x, nb.y
+        nb.x, nb.y = -1900, 0
+        a = nb.math('MULTIPLY', ua, 2.0 * math.pi)
+        b = nb.math('MULTIPLY', va, 2.0 * math.pi)
+        xyz = nb.comb_xyz(nb.math('MULTIPLY', nb.math('COSINE', a), rx),
+                          nb.math('MULTIPLY', nb.math('SINE', a), rx),
+                          nb.math('MULTIPLY', nb.math('COSINE', b), ry))
+        w = nb.math('MULTIPLY', nb.math('SINE', b), ry)
+        nb.x, nb.y = x, y
+        return xyz, w
+
     def paint_uv(self):
         if self._uv is None:
             x, y = self.nb.x, self.nb.y
@@ -2110,8 +2230,325 @@ def _paint_mix(nb, sh, i, layer, img, auto, noise_ch):
     return w, soft
 
 
+# ---- 配置（Placement）・タイリング崩し・凹凸の補正
+def _eff_rot(s, layer):
+    """実際に使う回転（ラジアン）。90°刻みの設定、またはタイル素材なら 90° の倍数にそろえる。"""
+    r = layer.place_rot
+    if layer.place_snap or s.tile_mode:
+        q = math.pi / 2.0
+        r = round(r / q) * q
+    return r
+
+
+def _bump_dist(s, layer):
+    """normal_from_height のときの凹凸の高さ (m)。テクスチャ1枚の大きさの 5% × ハイトの強さ。"""
+    size = 1.0
+    if layer.projection in ('TRIPLANAR', 'TOP') or s.tile_mode:
+        size = max(layer.tile_size, 1e-4)
+    return 0.05 * size * layer.height_strength_layer
+
+
+class _Place:
+    """レイヤーの配置：位置ずらし・回転・X/Y別々の繰り返し。値は Value ノードなので、動かしても再コンパイルされない
+    （タイル素材だけは整数回のくり返しが要るので作り直す）。
+    テクスチャ座標 t = S · R(−θ) · p + o。ノーマルマップは XY を R(θ)·F·Y で回す（F = セルの左右反転、Y = DirectX 用の上下反転）。"""
+
+    def __init__(self, nb, sh, i, layer, tile=False):
+        self.nb = nb
+        self.sh = sh
+        self.i = i
+        self.layer = layer
+        self.tile = tile
+        x, y = nb.x, nb.y
+        nb.x, nb.y = i * 700, 1150
+        self.rot = nb.value("L%d_pl_rot" % i, _eff_rot(sh.s, layer))
+        self.C = nb.math('COSINE', self.rot)
+        self.S = nb.math('SINE', self.rot)
+        self.nS = nb.math('MULTIPLY', self.S, -1.0)
+        self.ox = nb.value("L%d_pl_x" % i, layer.place_x)
+        self.oy = nb.value("L%d_pl_y" % i, layer.place_y)
+        if not tile:
+            self.sx = nb.value("L%d_pl_sx" % i, layer.place_sx)
+            self.sy = nb.value("L%d_pl_sy" % i, layer.place_sy)
+        self.fy = nb.value("L%d_nfy" % i, -1.0 if layer.normal_flip_y else 1.0)
+        nb.x, nb.y = x, y
+
+    def uv(self, u, v):
+        """平面の座標 (u, v) → テクスチャ座標 (tu, tv)。"""
+        nb = self.nb
+        ru = nb.math('MULTIPLY_ADD', self.S, v, c=nb.math('MULTIPLY', self.C, u))
+        rv = nb.math('MULTIPLY_ADD', self.C, v, c=nb.math('MULTIPLY', self.nS, u))
+        return (nb.math('MULTIPLY_ADD', ru, self.sx, c=self.ox),
+                nb.math('MULTIPLY_ADD', rv, self.sy, c=self.oy))
+
+    def tile_uv(self, uv, kx, ky):
+        """タイル素材：UV(0〜1) → (周期座標 u2, v2, テクスチャ座標 tu, tv)。u2, v2 は uv が1増えると整数 kx, ky ではなく 1 だけ増える
+        （どちらも uv の線形式なので、uv の端と端で継ぎ目なしにつながる）。"""
+        nb = self.nb
+        u, v, _z = nb.sep_xyz(uv)
+        u2 = nb.math('MULTIPLY_ADD', self.C, u, c=nb.math('MULTIPLY_ADD', self.S, v, c=nb.math('DIVIDE', self.ox, float(kx))))
+        v2 = nb.math('MULTIPLY_ADD', self.C, v, c=nb.math('MULTIPLY_ADD', self.nS, u, c=nb.math('DIVIDE', self.oy, float(ky))))
+        return u2, v2, nb.math('MULTIPLY', u2, float(kx)), nb.math('MULTIPLY', v2, float(ky))
+
+    def xf(self):
+        """ノーマルの向きの補正（回転角・左右反転・上下反転）。セルごとの回転は ATVertex が足す。"""
+        return (self.rot, 1.0, self.fy)
+
+
+def _wsum(nb, outs, ws):
+    """複数のサンプルを重みで足し合わせる（重みの合計は 1）。"""
+    res = {}
+    for key in KEYS:
+        if key in ("Color", "Normal"):
+            acc = nb.vmath('SCALE', outs[0][key], scale=ws[0])
+            for o, w in zip(outs[1:], ws[1:]):
+                acc = nb.vmath('ADD', acc, nb.vmath('SCALE', o[key], scale=w))
+            if key == "Normal":
+                acc = nb.vmath('NORMALIZE', acc)
+        else:
+            acc = nb.math('MULTIPLY', outs[0][key], ws[0])
+            for o, w in zip(outs[1:], ws[1:]):
+                acc = nb.math('MULTIPLY_ADD', o[key], w, c=acc)
+        res[key] = acc
+    return res
+
+
+def _lattice_square(nb, uL, vL):
+    """四角いセル：まわりの4つのセルと、その重み。セル(i, j)の中心は (i+0.5, j+0.5)。"""
+    gu = nb.math('SUBTRACT', uL, 0.5)
+    gv = nb.math('SUBTRACT', vL, 0.5)
+    iu, iv = nb.math('FLOOR', gu), nb.math('FLOOR', gv)
+    fu, fv = nb.math('FRACT', gu), nb.math('FRACT', gv)
+    gus = (nb.math('SUBTRACT', 1.0, fu), fu)
+    gvs = (nb.math('SUBTRACT', 1.0, fv), fv)
+    out = []
+    for du in (0, 1):
+        for dv in (0, 1):
+            out.append((nb.math('ADD', iu, float(du)), nb.math('ADD', iv, float(dv)),
+                        nb.math('MULTIPLY', gus[du], gvs[dv])))
+    return out
+
+
+def _lattice_hex(nb, uL, vL, a, b):
+    """六角形のセル（三角形の格子の頂点 3 つと重み）。格子の基底は (1/a, 0), (1/(2a), 1/b)。a, b は数値でもソケットでもよい。"""
+    x1 = nb.math('MULTIPLY_ADD', vL, nb.math('MULTIPLY', b, -0.5), c=nb.math('MULTIPLY', uL, a))
+    x2 = nb.math('MULTIPLY', vL, b)
+    b1, b2 = nb.math('FLOOR', x1), nb.math('FLOOR', x2)
+    f1, f2 = nb.math('FRACT', x1), nb.math('FRACT', x2)
+    z = nb.math('SUBTRACT', nb.math('SUBTRACT', 1.0, f1), f2)
+    q = nb.math('GREATER_THAN', z, 0.0)
+    nq = nb.math('SUBTRACT', 1.0, q)
+    v1 = (nb.math('ADD', b1, nq), nb.math('ADD', b2, nq), nb.math('ABSOLUTE', z))
+    v2 = (nb.math('ADD', b1, nq), nb.math('ADD', b2, q),
+          nb.mix('FLOAT', q, nb.math('SUBTRACT', 1.0, f2), f2))
+    v3 = (nb.math('ADD', b1, q), nb.math('ADD', b2, nq),
+          nb.mix('FLOAT', q, nb.math('SUBTRACT', 1.0, f1), f1))
+    return [v1, v2, v3]
+
+
+# タイリング崩し用の共有ノードグループ（ノードを何百個も並べると作り直しが遅いので、部品にしてある）
+AT_VER = 3
+AT_SQ, AT_HX, AT_VERTEX, AT_ACCUM = "CMX_ATLattice_SQ", "CMX_ATLattice_HX", "CMX_ATVertex", "CMX_ATAccum"
+_F, _V = "NodeSocketFloat", "NodeSocketVector"
+
+
+def _fresh_group(name, ver, spec, defaults=None):
+    """共有グループを用意する。バージョンが同じなら (グループ, False)。作り直すときは中身を空にして (グループ, True)。"""
+    g = bpy.data.node_groups.get(name)
+    if g is not None and g.get("cmx_ver") == ver:
+        return g, False
+    if g is None:
+        g = bpy.data.node_groups.new(name, "ShaderNodeTree")
+    g.nodes.clear()
+    g["cmx_ver"] = ver
+    _ensure_interface(g, spec, defaults)
+    return g, True
+
+
+def _group_io(g):
+    gi = g.nodes.new("NodeGroupInput"); gi.location = (-1600, 0)
+    go = g.nodes.new("NodeGroupOutput"); go.location = (1600, 0)
+    return gi, go
+
+
+def ensure_at_lattice(hexa):
+    n = 3 if hexa else 4
+    spec = [(nm, 'INPUT', _F) for nm in (("U", "V", "A", "B") if hexa else ("U", "V"))]
+    spec += [("%s%d" % (c, k), 'OUTPUT', _F) for k in range(n) for c in ("X", "Y", "W")]
+    g, fresh = _fresh_group(AT_HX if hexa else AT_SQ, AT_VER, spec, {"A": 1.0, "B": 2.0 / math.sqrt(3.0)})
+    if fresh:
+        gi, go = _group_io(g)
+        nb = _NB(g)
+        nb.x, nb.y = -1400, 300
+        vs = _lattice_hex(nb, gi.outputs["U"], gi.outputs["V"], gi.outputs["A"], gi.outputs["B"]) if hexa \
+            else _lattice_square(nb, gi.outputs["U"], gi.outputs["V"])
+        for k, v in enumerate(vs):
+            for c, sock in zip(("X", "Y", "W"), v):
+                g.links.new(sock, go.inputs["%s%d" % (c, k)])
+    return g
+
+
+def ensure_at_vertex():
+    """セル1つぶん：乱数で「ずらし・回転・反転」を決め、そのセルで素材を読むための座標とノーマルの行列を返す。"""
+    spec = [(nm, 'INPUT', _F) for nm in ("VX", "VY", "Wrap", "A", "B", "Seed", "Offset", "RotMode", "Flip",
+                                         "TU", "TV", "Extra", "Rot")]
+    spec += [("Vector", 'OUTPUT', _V), ("NAngle", 'OUTPUT', _F), ("NFlip", 'OUTPUT', _F)]
+    g, fresh = _fresh_group(AT_VERTEX, AT_VER, spec, {"A": 1.0, "B": 1.0})
+    if fresh:
+        gi, go = _group_io(g)
+        I = gi.outputs
+        nb = _NB(g)
+        nb.x, nb.y = -1400, 400
+        # セル番号をタイルの周期で巻き戻す（Wrap: 0 = しない、1 = 四角、2 = 六角形）
+        Ae, Be = nb.math('MAXIMUM', I["A"], 1.0), nb.math('MAXIMUM', I["B"], 1.0)
+        sqx, sqy = nb.math('FLOORED_MODULO', I["VX"], Ae), nb.math('FLOORED_MODULO', I["VY"], Be)
+        jq = nb.math('FLOOR', nb.math('DIVIDE', I["VY"], Be))
+        hxx = nb.math('FLOORED_MODULO', nb.math('MULTIPLY_ADD', jq, nb.math('MULTIPLY', Be, 0.5), c=I["VX"]), Ae)
+        is_sq = nb.math('MULTIPLY', nb.math('GREATER_THAN', I["Wrap"], 0.5), nb.math('LESS_THAN', I["Wrap"], 1.5))
+        is_hx = nb.math('GREATER_THAN', I["Wrap"], 1.5)
+        wx = nb.math('ADD', I["VX"], nb.math('ADD', nb.math('MULTIPLY', is_sq, nb.math('SUBTRACT', sqx, I["VX"])),
+                                              nb.math('MULTIPLY', is_hx, nb.math('SUBTRACT', hxx, I["VX"]))))
+        wy = nb.math('ADD', I["VY"], nb.math('MULTIPLY', nb.math('ADD', is_sq, is_hx), nb.math('SUBTRACT', sqy, I["VY"])))
+        wn = nb.node("ShaderNodeTexWhiteNoise")
+        wn.noise_dimensions = '3D'
+        nb.L.new(nb.comb_xyz(wx, wy, I["Seed"]), wn.inputs["Vector"])
+        rx, ry, rz = nb.sep_xyz(wn.outputs["Color"])
+        off_x, off_y = nb.math('MULTIPLY', rx, I["Offset"]), nb.math('MULTIPLY', ry, I["Offset"])
+        # 回転：RotMode 0 = なし、1 = 90°刻み、2 = 自由
+        step = nb.math('MULTIPLY', nb.math('FLOOR', nb.math('MULTIPLY', rz, 4.0)), math.pi / 2.0)
+        free = nb.math('MULTIPLY', rz, 2.0 * math.pi)
+        phi = nb.math('MULTIPLY', nb.math('GREATER_THAN', I["RotMode"], 0.5),
+                      nb.mix('FLOAT', nb.math('GREATER_THAN', I["RotMode"], 1.5), step, free))
+        f = nb.math('SUBTRACT', 1.0, nb.math('MULTIPLY', I["Flip"],
+                                             nb.math('MULTIPLY', nb.math('GREATER_THAN', wn.outputs["Value"], 0.5), 2.0)))
+        cu, su = nb.math('COSINE', phi), nb.math('SINE', phi)
+        ra = nb.math('MULTIPLY_ADD', cu, I["TU"], c=nb.math('MULTIPLY', su, I["TV"]))
+        rb = nb.math('MULTIPLY_ADD', cu, I["TV"], c=nb.math('MULTIPLY', nb.math('MULTIPLY', su, -1.0), I["TU"]))
+        vec = nb.comb_xyz(nb.math('ADD', nb.math('MULTIPLY', ra, f), off_x), nb.math('ADD', rb, off_y), I["Extra"])
+        g.links.new(vec, go.inputs["Vector"])
+        g.links.new(nb.math('ADD', I["Rot"], phi), go.inputs["NAngle"])
+        g.links.new(f, go.inputs["NFlip"])
+    return g
+
+
+def ensure_at_accum():
+    """セルのサンプルを 1 つずつ足し込む（Cycles の SVM スタックを使い切らないよう、サンプルを読んだらすぐ消費する）。
+    重み e = (セルの重み)^べき乗 × exp(3 × ハイト)。ハイトで混ぜるときは高い所が勝ち、ノイズで崩すときは重みにノイズを足す。
+    戻り値の合計を e の合計で割れば、混ぜた結果になる。"""
+    spec = []
+    for pre in ("Acc", ""):
+        spec += [(pre + "Color", 'INPUT', "NodeSocketColor"), (pre + "Roughness", 'INPUT', _F),
+                 (pre + "Metallic", 'INPUT', _F), (pre + "Normal", 'INPUT', _V), (pre + "Height", 'INPUT', _F)]
+    spec += [("AccWeight", 'INPUT', _F), ("Weight", 'INPUT', _F), ("Noise", 'INPUT', _F), ("Power", 'INPUT', _F),
+             ("Mix", 'INPUT', _F)]
+    spec += [(pre + k, 'OUTPUT', SOCK_TYPES[k]) for pre in ("Acc",) for k in KEYS] + [("AccWeight", 'OUTPUT', _F)]
+    g, fresh = _fresh_group(AT_ACCUM, AT_VER, spec, {"Power": 1.0})
+    if fresh:
+        gi, go = _group_io(g)
+        I = gi.outputs
+        nb = _NB(g)
+        nb.x, nb.y = -1400, 400
+        noisy = nb.math('MAXIMUM', nb.math('ADD', I["Weight"], nb.math('MULTIPLY', nb.math('SUBTRACT', I["Noise"], 0.5), 0.6)), 0.0)
+        w = nb.math('POWER', nb.mix('FLOAT', I["Mix"], I["Weight"], noisy), I["Power"])
+        # ハイトの影響：exp(3 h)。Mix = 1（ノイズ）のときは 1
+        hexp = nb.math('EXPONENT', nb.math('MULTIPLY', nb.math('MULTIPLY', I["Height"], 3.0), nb.math('SUBTRACT', 1.0, I["Mix"])))
+        e = nb.math('MULTIPLY', w, hexp)
+        for k in KEYS:
+            if k in ("Color", "Normal"):
+                r = nb.vmath('ADD', I["Acc" + k], nb.vmath('SCALE', I[k], scale=e))
+            else:
+                r = nb.math('MULTIPLY_ADD', I[k], e, c=I["Acc" + k])
+            g.links.new(r, go.inputs["Acc" + k])
+        g.links.new(nb.math('ADD', I["AccWeight"], e), go.inputs["AccWeight"])
+    return g
+
+
+def _anti_tile(nb, sh, i, layer, pl, tu, tv, extra, plane, tag, lat, inst):
+    """タイリング崩し（ランダムシート）。(tu, tv) = 配置済みのテクスチャ座標。
+    まわりのセルごとに乱数で「ずらし・回転・左右反転」を決め、それぞれで素材を読んで、境目だけ混ぜる。
+    戻り値は {Color, Roughness, Metallic, Normal, Height}。"""
+    hexa = layer.at_shape == 'HEX'
+    tile = lat["tile"]
+    # ノードは「入力を作ってから使う側を作る」順に作る（Cycles は作った順に処理するので、順番が乱れるとスタックを余計に使う）
+    if tile:
+        wrap = 2.0 if hexa else 1.0
+        if hexa:
+            lu, lv = lat["u2"], lat["v2"]
+            pa, pb = float(lat["a"]), float(lat["b"])
+        else:
+            lu = nb.math('MULTIPLY', lat["u2"], float(lat["nu"]))
+            lv = nb.math('MULTIPLY', lat["v2"], float(lat["nv"]))
+            pa, pb = float(lat["nu"]), float(lat["nv"])
+    else:
+        wrap, pa, pb = 0.0, 1.0, 1.0
+        lu, lv = nb.math('DIVIDE', tu, lat["cell"]), nb.math('DIVIDE', tv, lat["cell"])
+    lg = nb.node("ShaderNodeGroup", "L%d_atlat%s" % (i, tag))
+    lg.node_tree = ensure_at_lattice(hexa)
+    nb.link(lu, lg.inputs["U"])
+    nb.link(lv, lg.inputs["V"])
+    if tile and hexa:
+        lg.inputs["A"].default_value = pa
+        lg.inputs["B"].default_value = pb
+    rotmode = {'NONE': 0.0, 'STEP': 1.0, 'FREE': 2.0}[layer.at_rot]
+    if tile and rotmode == 2.0:
+        rotmode = 1.0              # 自由な角度だと、タイルの端で継ぎ目が出る
+    seed = layer.at_seed * 1.37 + plane * 5.11 + i * 3.7
+    vg = ensure_at_vertex()
+    ag = ensure_at_accum()
+    n = 3 if hexa else 4
+    acc = None
+    for k in range(n):
+        vn = nb.node("ShaderNodeGroup", "L%d_atv%s%d" % (i, tag, k))
+        vn.node_tree = vg
+        nb.link(lg.outputs["X%d" % k], vn.inputs["VX"])
+        nb.link(lg.outputs["Y%d" % k], vn.inputs["VY"])
+        for nm, v in (("Wrap", wrap), ("A", pa), ("B", pb), ("Seed", seed), ("RotMode", rotmode),
+                      ("Flip", 1.0 if layer.at_flip else 0.0)):
+            vn.inputs[nm].default_value = v
+        nb.link(lat["amt"], vn.inputs["Offset"])
+        nb.link(tu, vn.inputs["TU"])
+        nb.link(tv, vn.inputs["TV"])
+        nb.link(extra, vn.inputs["Extra"])
+        nb.link(pl.rot, vn.inputs["Rot"])
+        o = inst(vn.outputs["Vector"], plane, "%s%d" % (tag, k), (vn.outputs["NAngle"], vn.outputs["NFlip"], pl.fy))
+        an = nb.node("ShaderNodeGroup", "L%d_ata%s%d" % (i, tag, k))
+        an.node_tree = ag
+        for key in KEYS:
+            nb.link(o[key], an.inputs[key])
+            if acc is not None:
+                nb.link(acc[key], an.inputs["Acc" + key])
+        if acc is not None:
+            nb.link(acc["Weight"], an.inputs["AccWeight"])
+        nb.link(lg.outputs["W%d" % k], an.inputs["Weight"])
+        nb.link(sh.noise[k % 3], an.inputs["Noise"])
+        nb.link(lat["pw"], an.inputs["Power"])
+        an.inputs["Mix"].default_value = 1.0 if layer.at_mix == 'NOISE' else 0.0
+        acc = {key: an.outputs["Acc" + key] for key in KEYS}
+        acc["Weight"] = an.outputs["AccWeight"]
+    inv = nb.math('DIVIDE', 1.0, nb.math('MAXIMUM', acc["Weight"], 1e-30))
+    res = {"Color": nb.vmath('SCALE', acc["Color"], scale=inv), "Normal": nb.vmath('NORMALIZE', acc["Normal"])}
+    for key in ("Roughness", "Metallic", "Height"):
+        res[key] = nb.math('MULTIPLY', acc[key], inv)
+    return res
+
+
+def _normal_strength(nb, sh, i, layer, n):
+    """ノーマルの強さ（Blender のノーマルマップの Strength と同じ式）。1 でそのまま、0 で面の向きだけ、2 で 2 倍。"""
+    k = nb.value("L%d_nstr" % i, layer.normal_strength)
+    d = nb.vmath('SUBTRACT', n, sh.geo_n)
+    return nb.vmath('NORMALIZE', nb.vmath('ADD', sh.geo_n, nb.vmath('SCALE', d, scale=k)))
+
+
 def _material_sockets(nb, sh, i, layer, cache):
+    outs = _material_sockets_raw(nb, sh, i, layer, cache)
+    if layer.material is not None:
+        outs["Normal"] = _normal_strength(nb, sh, i, layer, outs["Normal"])
+    return outs
+
+
+def _material_sockets_raw(nb, sh, i, layer, cache):
     obj = sh.obj
+    s = sh.s
     mat = layer.material
     if mat is None:
         rgb = nb.node("ShaderNodeRGB", "L%d_rgb" % i)
@@ -2120,15 +2557,18 @@ def _material_sockets(nb, sh, i, layer, cache):
                 "Metallic": nb.value("L%d_metal" % i, layer.metallic), "Normal": sh.geo_n,
                 "Height": sh.noise[i % 3]}
 
+    bump = bool(layer.normal_from_height)
+    bd = nb.value("L%d_bumpd" % i, _bump_dist(s, layer)) if bump else None
+
     def group(mode, uv=""):
-        key = (mat.name, mode, uv)
+        key = (mat.name, mode, uv, bump)
         g = cache.get(key)
         if g is None:
-            g = build_layer_group(mat, mode, uv)
+            g = build_layer_group(mat, mode, uv, bump)
             cache[key] = g
         return g
 
-    def inst(g, vec, plane, tag, torus=None):
+    def inst(g, vec, plane, tag, torus=None, xf=None):
         gn = nb.node("ShaderNodeGroup", "L%d_group%s" % (i, tag))
         gn.node_tree = g
         nb.link(vec, gn.inputs["Vector"])
@@ -2136,21 +2576,45 @@ def _material_sockets(nb, sh, i, layer, cache):
         if torus is not None:
             nb.link(torus[0], gn.inputs["TorusXYZ"])
             nb.link(torus[1], gn.inputs["TorusW"])
+        if xf is not None:
+            for nm, sk in zip(("NAngle", "NFlip", "NFlipY"), xf):
+                nb.link(sk, gn.inputs[nm])
+        if bd is not None:
+            nb.link(bd, gn.inputs["BumpDist"])
         return {k: gn.outputs[k] for k in KEYS}
+
+    proj = layer.projection
+    use_at = bool(layer.anti_tile) and _has_images(mat) and (sh.tile or proj != 'ORIGINAL')
+    lat_common = None
+    if use_at:
+        lat_common = {"amt": nb.value("L%d_at_off" % i, layer.at_offset)}
+        b = nb.value("L%d_at_blend" % i, layer.at_blend)
+        # くっきり度：境目の幅 0 → 指数 16（ほぼ切り替え）、1 → 指数 1（なめらか）
+        sharp = nb.math('SUBTRACT', 1.0, b)
+        lat_common["pw"] = nb.math('MULTIPLY_ADD', nb.math('MULTIPLY', sharp, sharp), 15.0, c=1.0)
 
     if sh.tile:
         # タイル素材：UV（0〜1）を整数回くり返し、ノイズ類は4Dドーナツ座標で継ぎ目なし
-        k = tile_repeats(sh.s, layer)
-        sc = nb.node("ShaderNodeVectorMath", "L%d_tile" % i)
-        sc.operation = 'SCALE'
-        sc.hide = True
-        nb.L.new(sh.paint_uv(), sc.inputs[0])
-        sc.inputs["Scale"].default_value = float(k)
-        return inst(group('T', PAINT_UV), sc.outputs[0], 2.0, "", torus=sh.torus(k / (2.0 * math.pi)))
+        k = tile_repeats(s, layer)
+        kx = max(1, int(round(k * layer.place_sx)))
+        ky = max(1, int(round(k * layer.place_sy)))
+        pl = _Place(nb, sh, i, layer, tile=True)
+        u2, v2, tu, tv = pl.tile_uv(sh.paint_uv(), kx, ky)
+        xyz, w = sh.torus2(kx / (2.0 * math.pi), ky / (2.0 * math.pi), u2, v2)
+        g = group('T', PAINT_UV)
+        if not use_at:
+            return inst(g, nb.comb_xyz(tu, tv, 0.0), 2.0, "", torus=(xyz, w), xf=pl.xf())
+        nu = max(1, int(round(kx / max(layer.at_cell, 0.05))))
+        nv = max(1, int(round(ky / max(layer.at_cell, 0.05))))
+        lat = dict(lat_common, tile=True, u2=u2, v2=v2, nu=nu, nv=nv, a=nu,
+                   b=max(2, 2 * int(round(nu * 2.0 / math.sqrt(3.0) / 2.0))))
+        return _anti_tile(nb, sh, i, layer, pl, tu, tv, 0.0, 0.0, "",  lat,
+                          lambda vec, plane, tag, xf: inst(g, vec, 2.0, tag, torus=(xyz, w), xf=xf))
 
-    proj = layer.projection
     if proj == 'ORIGINAL':
         return inst(group('O'), None, 2.0, "")
+    lat = dict(lat_common, tile=False, cell=nb.value("L%d_at_cell" % i, max(layer.at_cell, 0.05))) if use_at else None
+    pl = _Place(nb, sh, i, layer)
     if proj == 'UV':
         uvname = layer.uv_map if obj.data.uv_layers.get(layer.uv_map) is not None else _default_uv(obj)
         uvn = nb.node("ShaderNodeUVMap")
@@ -2160,39 +2624,41 @@ def _material_sockets(nb, sh, i, layer, cache):
         sc.hide = True
         nb.L.new(uvn.outputs["UV"], sc.inputs[0])
         sc.inputs["Scale"].default_value = layer.uv_repeat
-        return inst(group('U', uvname), sc.outputs[0], 2.0, "")
+        g = group('U', uvname)
+        u, v, z = nb.sep_xyz(sc.outputs[0])
+        tu, tv = pl.uv(u, v)
+        if use_at:
+            return _anti_tile(nb, sh, i, layer, pl, tu, tv, z, 2.0, "", lat,
+                              lambda vec, plane, tag, xf: inst(g, vec, 2.0, tag, xf=xf))
+        return inst(g, nb.comb_xyz(tu, tv, z), 2.0, "", xf=pl.xf())
     sc = nb.node("ShaderNodeVectorMath", "L%d_tile" % i)
     sc.operation = 'SCALE'
     sc.hide = True
     nb.L.new(sh.tc.outputs["Object"], sc.inputs[0])
     sc.inputs["Scale"].default_value = 1.0 / max(layer.tile_size, 1e-4)
     g = group('P')
-    if proj == 'TOP' or not _has_images(mat):
-        return inst(g, sc.outputs[0], 2.0, "")
-    # トリプラナー：3方向から投影して法線の向きで混ぜる
     x, y, z = nb.sep_xyz(sc.outputs[0])
-    outs = [inst(g, nb.comb_xyz(y, z, x), 0.0, "X"),
-            inst(g, nb.comb_xyz(x, z, y), 1.0, "Y"),
-            inst(g, sc.outputs[0], 2.0, "Z")]
+    if proj == 'TOP' or not _has_images(mat):
+        tu, tv = pl.uv(x, y)
+        if use_at:
+            return _anti_tile(nb, sh, i, layer, pl, tu, tv, z, 2.0, "", lat,
+                              lambda vec, plane, tag, xf: inst(g, vec, 2.0, tag, xf=xf))
+        return inst(g, nb.comb_xyz(tu, tv, z), 2.0, "", xf=pl.xf())
+    # トリプラナー：3方向から投影して法線の向きで混ぜる（X面は (y, z)、Y面は (x, z)、Z面は (x, y) を平面の座標にする）
+    outs = []
+    for (a, b_, c_, plane, tg) in ((y, z, x, 0.0, "X"), (x, z, y, 1.0, "Y"), (x, y, z, 2.0, "Z")):
+        tu, tv = pl.uv(a, b_)
+        if use_at:
+            outs.append(_anti_tile(nb, sh, i, layer, pl, tu, tv, c_, plane, tg, lat,
+                                   lambda vec, pln, tag, xf: inst(g, vec, pln, tag, xf=xf)))
+        else:
+            outs.append(inst(g, nb.comb_xyz(tu, tv, c_), plane, tg, xf=pl.xf()))
     k = nb.value("L%d_tri_k" % i, layer.tri_sharp)
     pw = nb.vmath('POWER', nb.vmath('ABSOLUTE', sh.tc.outputs["Normal"]), nb.comb_xyz(k, k, k))
     tot = nb.vmath('DOT_PRODUCT', pw, (1.0, 1.0, 1.0))
     wv = nb.vmath('SCALE', pw, scale=nb.math('DIVIDE', 1.0, nb.math('MAXIMUM', tot, 1e-6)))
     ws = nb.sep_xyz(wv)
-    res = {}
-    for key in KEYS:
-        if key in ("Color", "Normal"):
-            acc = nb.vmath('SCALE', outs[0][key], scale=ws[0])
-            acc = nb.vmath('ADD', acc, nb.vmath('SCALE', outs[1][key], scale=ws[1]))
-            acc = nb.vmath('ADD', acc, nb.vmath('SCALE', outs[2][key], scale=ws[2]))
-            if key == "Normal":
-                acc = nb.vmath('NORMALIZE', acc)
-        else:
-            acc = nb.math('MULTIPLY', outs[0][key], ws[0])
-            acc = nb.math('MULTIPLY_ADD', outs[1][key], ws[1], c=acc)
-            acc = nb.math('MULTIPLY_ADD', outs[2][key], ws[2], c=acc)
-        res[key] = acc
-    return res
+    return _wsum(nb, outs, [ws[0], ws[1], ws[2]])
 
 
 def tile_repeats(s, layer):
@@ -2246,11 +2712,53 @@ def _apply_adjust(nb, i, layer, prev, mask):
         geo = nb.node("ShaderNodeNewGeometry")
         flat = nb.math('MULTIPLY', mask, nb.value("L%d_wet_flat" % i, layer.wet_flat))
         out["Normal"] = nb.vmath('NORMALIZE', nb.mix('VECTOR', flat, prev["Normal"], geo.outputs["Normal"]))
+        if "Relief" in prev:
+            out["Relief"] = nb.mix('FLOAT', flat, prev["Relief"], 0.5)      # 濡れた所は凹凸も平らに
     elif t == 'TINT':
         rgb = nb.node("ShaderNodeRGB", "L%d_tint_color" % i)
         rgb.outputs[0].default_value = (*layer.tint_color, 1.0)
         out["Color"] = nb.mix('RGBA', mask, prev["Color"], rgb.outputs[0], blend=layer.tint_blend)
     return out
+
+
+def _stack_bias(layer):
+    """重ね方（上から積もる＝+、下から出る＝−）に量を掛けたもの。"""
+    return layer.stack_amount * {'SETTLE': 1.0, 'EMERGE': -1.0}.get(layer.stack_mode, 0.0)
+
+
+def _macro_variation(nb, sh, s, prev):
+    """全体の「大きなムラ」：数 m 単位のノイズで、最終の明るさ・色相・ラフネスをわずかに揺らす。
+    タイリング感（同じ模様の繰り返し）を目立たなくする。macro_amount = 0 なら何も作らない。"""
+    if s.macro_amount <= 0.0:
+        return
+    nz = nb.node("ShaderNodeTexNoise", "G_macro_noise")
+    nz.hide = True
+    nz.inputs["Detail"].default_value = 2.0
+    nz.inputs["Roughness"].default_value = 0.5
+    if sh.tile:
+        # タイル素材：タイル1枚にちょうど整数個のムラが入るようにして、継ぎ目なしにする
+        n = max(1, int(round(s.tile_size_m / max(s.macro_scale, 0.01))))
+        nz.noise_dimensions = '4D'
+        xyz, w = sh.torus(n / (2.0 * math.pi))
+        nb.L.new(xyz, nz.inputs["Vector"])
+        nb.L.new(w, nz.inputs["W"])
+        nz.inputs["Scale"].default_value = 1.0
+    else:
+        nb.L.new(sh.tc.outputs["Object"], nz.inputs["Vector"])
+        nb.L.new(nb.value("G_macro_scale", 1.0 / max(s.macro_scale, 0.01)), nz.inputs["Scale"])
+    sep = nb.node("ShaderNodeSeparateColor")
+    sep.hide = True
+    nb.L.new(nz.outputs["Color"], sep.inputs[0])
+    amt = nb.value("G_macro_amt", s.macro_amount)
+    d = [nb.math('MULTIPLY', nb.math('SUBTRACT', c, 0.5), 2.0) for c in sep.outputs]
+    hs = nb.node("ShaderNodeHueSaturation")
+    hs.hide = True
+    nb.L.new(nb.math('MULTIPLY_ADD', d[1], nb.math('MULTIPLY', amt, 0.1), c=0.5), hs.inputs["Hue"])
+    nb.L.new(nb.math('MULTIPLY_ADD', d[0], amt, c=1.0), hs.inputs["Value"])
+    nb.link(prev["Color"], hs.inputs["Color"])
+    prev["Color"] = hs.outputs["Color"]
+    prev["Roughness"] = nb.math('ADD', prev["Roughness"], nb.math('MULTIPLY', d[2], nb.math('MULTIPLY', amt, 0.5)),
+                                clamp=True)
 
 
 def _want_light(obj):
@@ -2331,8 +2839,14 @@ def rebuild_material(obj, light=None):
         is_mat = i == 0 or layer.kind == 'MATERIAL'
         if is_mat:
             outs = _light_sockets(nb, sh, i, layer) if light else _material_sockets(nb, sh, i, layer, cache)
-            outs["Height"] = nb.math('MULTIPLY_ADD', outs["Height"], layer.height_contrast, clamp=True,
+            inv = nb.value("L%d_hinv" % i, 1.0 if layer.height_invert else 0.0)
+            hraw = nb.math('MULTIPLY_ADD', outs["Height"], nb.math('SUBTRACT', 1.0, nb.math('MULTIPLY', inv, 2.0)), c=inv)
+            outs["Height"] = nb.math('MULTIPLY_ADD', hraw, layer.height_contrast, clamp=True,
                                      name="L%d_h" % i, c=layer.height_offset)
+            # 凹凸の高さ（全体の凹凸・ディスプレイスメント・ハイトの書き出し用）。強さ 1 なら「ハイト」そのまま
+            hs_l = nb.value("L%d_hs" % i, layer.height_strength_layer)
+            outs["Relief"] = nb.math('MULTIPLY_ADD', outs["Height"], hs_l,
+                                     c=nb.math('SUBTRACT', 0.5, nb.math('MULTIPLY', hs_l, 0.5)))
             outs["Color"] = nb.mix('RGBA', sh.g_dbg, outs["Color"], dbg_col)
         if i == 0 or prev is None:
             prev = outs if is_mat else prev
@@ -2346,15 +2860,30 @@ def rebuild_material(obj, light=None):
             noise_ch = nb.math('SUBTRACT', 1.0, noise_ch)
         w, soft = _paint_mix(nb, sh, i, layer, img, auto, noise_ch)
         if is_mat:
+            b_in = dict(outs)
+            relief_b = outs["Relief"]
+            if layer.stack_mode != 'NORMAL':
+                # 上から積もる（下の低い所に出やすい）／下から出る（下の高い所に出やすい）：重ねるときのハイトを偏らせる
+                sb = nb.value("L%d_stack" % i, _stack_bias(layer))
+                dh = nb.math('MULTIPLY', nb.math('SUBTRACT', 0.5, prev["Height"]), sb)
+                b_in["Height"] = nb.math('ADD', outs["Height"], dh, clamp=True)
+            if layer.wrap_amount > 0.0:
+                # 下の形に沿わせる：下の凹凸（ノーマル・高さ）を、このレイヤーにも足す
+                wa = nb.value("L%d_wrap" % i, layer.wrap_amount)
+                dn = nb.vmath('SCALE', nb.vmath('SUBTRACT', prev["Normal"], sh.geo_n), scale=wa)
+                b_in["Normal"] = nb.vmath('NORMALIZE', nb.vmath('ADD', outs["Normal"], dn))
+                relief_b = nb.math('MULTIPLY_ADD', nb.math('SUBTRACT', prev["Relief"], 0.5), wa, c=relief_b)
             hn = nb.node("ShaderNodeGroup", "L%d_blend" % i)
             hn.node_tree = hl
             for k in KEYS:
                 nb.link(prev[k], hn.inputs["A " + k])
-                nb.link(outs[k], hn.inputs["B " + k])
+                nb.link(b_in[k], hn.inputs["B " + k])
             nb.L.new(w, hn.inputs["Weight"])
             nb.L.new(soft, hn.inputs["Softness"])
             nb.L.new(sh.g_hs, hn.inputs["Height Strength"])
+            prev_relief = prev["Relief"]
             prev = {k: hn.outputs[k] for k in KEYS}
+            prev["Relief"] = nb.mix('FLOAT', hn.outputs["Factor"], prev_relief, relief_b)
             vis = hn.outputs["Factor"]
         else:
             mask = _adjust_mask(nb, w, soft)
@@ -2364,10 +2893,24 @@ def rebuild_material(obj, light=None):
         if view is not None and view["layer"] == i and view["item"] is None:
             view["sock"] = vis
     if prev is not None:
+        nb.x, nb.y = n_layers * 700 + 50, 600
+        if not light:
+            _macro_variation(nb, sh, s, prev)
+            if s.bump_strength > 0.0:
+                # 全体の凹凸：最終の凹凸の高さから Bump を作り、最終のノーマルに重ねる（苔が岩の上に盛り上がって見える）
+                bn = nb.node("ShaderNodeBump", "G_bump")
+                nb.L.new(nb.value("G_bump_str", s.bump_strength), bn.inputs["Strength"])
+                nb.L.new(nb.value("G_bump_dist", s.bump_distance), bn.inputs["Distance"])
+                nb.L.new(prev["Relief"], bn.inputs["Height"])
+                nb.link(prev["Normal"], bn.inputs["Normal"])
+                prev["Normal"] = bn.outputs["Normal"]
+        prev["Height"] = prev["Relief"]       # 書き出すハイトは「凹凸の高さ」（強さ 1・設定なしなら今までと同じ）
         # 焼き込み用の出口（OUT_Color など）を経由して BSDF につなぐ
         nb.x, nb.y = n_layers * 700 + 50, 300
         for k in KEYS:
             rr = nb.node("NodeReroute", "OUT_" + k)
+            if not isinstance(prev[k], bpy.types.NodeSocket):      # 簡易表示でベースだけのとき、定数のことがある
+                prev[k] = nb.value("OUT_const_" + k, prev[k])
             nb.link(prev[k], rr.inputs[0])
             prev[k] = rr.outputs[0]
         nb.link(prev["Color"], bsdf.inputs["Base Color"])
@@ -2507,9 +3050,12 @@ def _node(obj, name):
 
 
 def _set_val(obj, name, v):
+    """名前の付いた Value ノードの値だけ書き換える（再コンパイルなし）。ノードがなければ False。"""
     n = _node(obj, name)
     if n is not None:
         n.outputs[0].default_value = v
+        return True
+    return False
 
 
 def _upd_rebuild(self, context):
@@ -2546,6 +3092,7 @@ def _upd_tile(self, context):
     if n is not None:
         n.inputs["Scale"].default_value = (self.uv_repeat if self.projection == 'UV'
                                            else 1.0 / max(self.tile_size, 1e-4))
+    _sync_bump(obj, i, self)
 
 
 def _upd_tri(self, context):
@@ -2559,6 +3106,121 @@ def _upd_height(self, context):
     if n is not None:
         n.inputs[1].default_value = self.height_contrast
         n.inputs[2].default_value = self.height_offset
+
+
+def _live(obj, pairs):
+    """Value ノードの値だけ書き換える。1つでもノードが見つからなければ（まだ作られていない）作り直す。"""
+    if not obj.cmx.enabled or _SUSPEND[0]:
+        return
+    ok = True
+    for name, v in pairs:
+        if not _set_val(obj, name, v):
+            ok = False
+    if not ok:
+        rebuild_material(obj)
+
+
+def _layer_live_ok(obj, layer):
+    """この設定が、今のマテリアルのノードに出ているか。単色・簡易表示中・非表示のレイヤーでは何も作られない。"""
+    return (layer.kind == 'MATERIAL' and layer.material is not None and not _is_light(obj) and
+            (layer.enabled or obj.cmx.layers[0].as_pointer() == layer.as_pointer()))
+
+
+def _sync_bump(obj, i, layer):
+    _set_val(obj, "L%d_bumpd" % i, _bump_dist(obj.cmx, layer))
+
+
+def _upd_place(self, context):
+    """配置（位置ずらし・回転・X/Y別々の繰り返し）。タイル素材は整数回のくり返しなので作り直す。"""
+    obj, i = _layer_index(self)
+    s = obj.cmx
+    if i < 0 or not s.enabled or _SUSPEND[0] or not _layer_live_ok(obj, self):
+        return
+    if s.tile_mode:
+        rebuild_material(obj)
+        return
+    if self.projection == 'ORIGINAL':
+        return
+    _live(obj, [("L%d_pl_rot" % i, _eff_rot(s, self)), ("L%d_pl_x" % i, self.place_x),
+                ("L%d_pl_y" % i, self.place_y), ("L%d_pl_sx" % i, self.place_sx),
+                ("L%d_pl_sy" % i, self.place_sy)])
+
+
+def _upd_relief(self, context):
+    """ノーマルの強さ・ハイトの強さ・ハイトの反転・DirectX 形式・重ね方の量（Value ノードだけ書き換え）。"""
+    obj, i = _layer_index(self)
+    if i < 0 or not obj.cmx.enabled or _SUSPEND[0] or _is_light(obj) or self.kind != 'MATERIAL':
+        return
+    if not (self.enabled or i == 0):
+        return
+    pairs = [("L%d_hinv" % i, 1.0 if self.height_invert else 0.0), ("L%d_hs" % i, self.height_strength_layer)]
+    if self.material is not None:
+        pairs += [("L%d_nstr" % i, self.normal_strength), ("L%d_nfy" % i, -1.0 if self.normal_flip_y else 1.0)]
+    if self.normal_from_height and self.material is not None:
+        pairs.append(("L%d_bumpd" % i, _bump_dist(obj.cmx, self)))
+    if self.stack_mode != 'NORMAL' and i > 0:
+        pairs.append(("L%d_stack" % i, _stack_bias(self)))
+    if self.wrap_amount > 0.0 and i > 0:
+        pairs.append(("L%d_wrap" % i, self.wrap_amount))
+    _live(obj, pairs)
+
+
+def _upd_at_live(self, context):
+    """タイリング崩しの、位置ずらし・境目の幅（Value ノードだけ書き換え）。"""
+    obj, i = _layer_index(self)
+    if i < 0 or not obj.cmx.enabled or _SUSPEND[0] or not _layer_live_ok(obj, self) or not self.anti_tile:
+        return
+    _live(obj, [("L%d_at_off" % i, self.at_offset), ("L%d_at_blend" % i, self.at_blend)])
+
+
+def _upd_at_cell(self, context):
+    """セルの大きさ。タイル素材のセルは整数個なので作り直す。"""
+    obj, i = _layer_index(self)
+    s = obj.cmx
+    if i < 0 or not s.enabled or _SUSPEND[0] or not _layer_live_ok(obj, self) or not self.anti_tile:
+        return
+    if s.tile_mode:
+        rebuild_material(obj)
+        return
+    _live(obj, [("L%d_at_cell" % i, max(self.at_cell, 0.05))])
+
+
+def _upd_struct(self, context):
+    """ノードの作りが変わる設定（タイリング崩しの入り切り・形・回転、ハイトから凹凸、重ね方の種類など）。"""
+    if self.id_data.cmx.enabled and not _SUSPEND[0]:
+        rebuild_material(self.id_data)
+
+
+def _upd_macro(self, context):
+    obj = self.id_data
+    if not self.enabled or _SUSPEND[0]:
+        return
+    if self.macro_amount <= 0.0:
+        if _node(obj, "G_macro_noise") is not None:
+            rebuild_material(obj)
+        return
+    if self.tile_mode:
+        rebuild_material(obj)       # タイル素材は、1枚に入るムラの数（整数）が変わるので作り直す
+        return
+    _live(obj, [("G_macro_amt", self.macro_amount), ("G_macro_scale", 1.0 / max(self.macro_scale, 0.01))])
+
+
+def _upd_bump(self, context):
+    obj = self.id_data
+    if not self.enabled or _SUSPEND[0]:
+        return
+    if self.bump_strength <= 0.0:
+        if _node(obj, "G_bump") is not None:
+            rebuild_material(obj)       # 0 に戻したら Bump ノードごと外す（重いので）
+        return
+    _live(obj, [("G_bump_str", self.bump_strength), ("G_bump_dist", self.bump_distance)])
+
+
+def _upd_disp(self, context):
+    md = self.id_data.modifiers.get(DISP_MOD)
+    if md is not None:
+        md.strength = self.disp_strength
+        md.mid_level = self.disp_mid
 
 
 def _upd_opacity(self, context):
@@ -2877,6 +3539,63 @@ class CMX_Layer(bpy.types.PropertyGroup):
     tint_blend: EnumProperty(name="重ね方", default='MIX', update=_upd_rebuild, items=[
         ('MIX', "通常", ""), ('MULTIPLY', "乗算", ""), ('OVERLAY', "オーバーレイ", ""),
         ('SCREEN', "スクリーン", ""), ('SOFT_LIGHT', "ソフトライト", "")])
+    # 配置（Placement）
+    place_x: FloatProperty(name="ずらし X", default=0.0, soft_min=-1.0, soft_max=1.0, update=_upd_place,
+                           description="テクスチャを横にずらす量（テクスチャ1枚分 = 1.0）")
+    place_y: FloatProperty(name="ずらし Y", default=0.0, soft_min=-1.0, soft_max=1.0, update=_upd_place,
+                           description="テクスチャを縦にずらす量（テクスチャ1枚分 = 1.0）")
+    place_rot: FloatProperty(name="回転", default=0.0, subtype='ANGLE', unit='ROTATION', update=_upd_place,
+                             description="テクスチャを回す角度。凹凸（ノーマル）の向きも一緒に回ります")
+    place_snap: BoolProperty(name="90°刻み", default=False, update=_upd_place,
+                             description="回転を 90° ごとにそろえる（タイル素材では常にこうなります）")
+    place_sx: FloatProperty(name="繰り返し X", default=1.0, min=0.01, soft_max=8.0, update=_upd_place,
+                            description="横方向のくり返しの倍率。2 にするとテクスチャが横に半分の大きさになる")
+    place_sy: FloatProperty(name="繰り返し Y", default=1.0, min=0.01, soft_max=8.0, update=_upd_place,
+                            description="縦方向のくり返しの倍率。2 にするとテクスチャが縦に半分の大きさになる")
+    # 凹凸（ノーマル・ハイト）
+    normal_strength: FloatProperty(name="細かい凹凸（ノーマル）", default=1.0, min=0.0, max=2.0, subtype='FACTOR',
+                                   update=_upd_relief,
+                                   description="素材のノーマルマップの強さ。0で平ら、1で素材のまま、2で2倍")
+    normal_flip_y: BoolProperty(name="DirectX 形式のノーマル", default=False, update=_upd_relief,
+                                description="ノーマルマップの上下が逆（DirectX 形式の素材）なときにオン。凹凸が逆に見えたら試す")
+    normal_from_height: BoolProperty(name="ハイトから凹凸を作る", default=False, update=_upd_struct,
+                                     description="素材のハイト（高さ）から凹凸を作って足す。ノーマルマップのない素材向け。少し重くなります")
+    height_strength_layer: FloatProperty(name="大きい凹凸（ハイト）", default=1.0, min=0.0, max=2.0, subtype='FACTOR',
+                                         update=_upd_relief,
+                                         description="このレイヤーのハイトの強さ。「全体の凹凸」やディスプレイスメント、ハイトの書き出しに効く。1で今まで通り")
+    height_invert: BoolProperty(name="ハイトを反転", default=False, update=_upd_relief,
+                                description="ハイト（高さ）を逆にする。レイヤーの境目の混ざり方と、凹凸の高さが逆になる")
+    stack_mode: EnumProperty(name="重なり方", default='NORMAL', update=_upd_struct, items=[
+        ('NORMAL', "標準", "下のレイヤーの形は気にせず重ねる"),
+        ('SETTLE', "上から積もる", "下のレイヤーの低い所（くぼみ）に先にたまる。土・砂・水・苔向け"),
+        ('EMERGE', "下から出る", "下のレイヤーの高い所（出っ張り）から先に顔を出す。摩耗・剥がれ向け")])
+    stack_amount: FloatProperty(name="偏りの強さ", default=0.5, min=0.0, max=1.0, subtype='FACTOR',
+                                update=_upd_relief, description="下のレイヤーの凹凸に沿って、どれだけ偏って出るか")
+    wrap_amount: FloatProperty(name="下の形に沿わせる", default=0.0, min=0.0, max=1.0, subtype='FACTOR',
+                               update=_upd_relief,
+                               description="下のレイヤーの凹凸（ノーマル・高さ）をこのレイヤーにも写す。苔が岩の形に沿って乗る感じ")
+    # タイリング崩し（ランダムシート）
+    anti_tile: BoolProperty(name="タイリング崩しを使う", default=False, update=_upd_struct,
+                            description="同じテクスチャの繰り返しが目立たないよう、セルごとに位置・向きをランダムに変えて混ぜる。"
+                                        "重くなります（トリプラナーでは最大12回サンプル）。簡易表示中は使われません")
+    at_cell: FloatProperty(name="セルの大きさ", default=1.0, min=0.05, soft_max=8.0, update=_upd_at_cell,
+                           description="ランダムに変える区画の大きさ（テクスチャ何枚分か）。小さいほど細かく入れ替わる")
+    at_shape: EnumProperty(name="セルの形", default='HEX', update=_upd_struct, items=[
+        ('SQUARE', "四角", "四角いセル（4つ混ぜる）"), ('HEX', "六角形", "六角形のセル（3つ混ぜる。軽くて境目が目立ちにくい）")])
+    at_rot: EnumProperty(name="回転", default='STEP', update=_upd_struct, items=[
+        ('NONE', "なし", "回さない"), ('STEP', "90°刻み", "セルごとに 90° ずつ回す"),
+        ('FREE', "自由", "セルごとに好きな角度に回す（タイル素材では 90° 刻みになります）")])
+    at_flip: BoolProperty(name="左右反転も混ぜる", default=True, update=_upd_struct,
+                          description="セルごとに左右反転も混ぜる（凹凸の向きは自動で合わせます）")
+    at_offset: FloatProperty(name="位置ずらし", default=1.0, min=0.0, max=1.0, subtype='FACTOR',
+                             update=_upd_at_live, description="セルごとのずらし量。0でずらさない、1でテクスチャ1枚分まで自由にずらす")
+    at_blend: FloatProperty(name="境目の幅", default=0.4, min=0.0, max=1.0, subtype='FACTOR',
+                            update=_upd_at_live, description="セルの境目をぼかす幅。小さいとくっきり、大きいとなめらか")
+    at_mix: EnumProperty(name="境目の混ぜ方", default='HEIGHT', update=_upd_struct, items=[
+        ('HEIGHT', "ハイトで混ぜる", "素材の高い所が勝つように混ぜる（境目が自然）"),
+        ('NOISE', "ノイズで崩す", "境目をノイズで崩す（ハイトのない素材向け）")])
+    at_seed: IntProperty(name="シード", default=0, min=0, max=9999, update=_upd_struct,
+                         description="ランダムの種。数字を変えると配置が変わる")
 
 
 class CMX_MatRef(bpy.types.PropertyGroup):
@@ -2948,6 +3667,22 @@ class CMX_Settings(bpy.types.PropertyGroup):
                                description="継ぎ目なしテクスチャ1枚が表す実際の大きさ")
     tile_preview: BoolProperty(name="3×3に並べて継ぎ目を確認", default=False, update=_upd_tile_preview,
                                description="同じタイルを3×3に並べて表示し、継ぎ目が出ていないか確かめる（焼き込みには影響しません）")
+    # 全体の大きなムラ・全体の凹凸・ディスプレイスメント
+    macro_amount: FloatProperty(name="大きなムラ", default=0.0, min=0.0, max=1.0, subtype='FACTOR',
+                                update=_upd_macro,
+                                description="数 m 単位のゆるいムラで、明るさ・色相・ラフネスをわずかに揺らす。繰り返し感を消すのに効く。0でなし")
+    macro_scale: FloatProperty(name="ムラの大きさ (m)", default=3.0, min=0.05, soft_max=50.0, unit='LENGTH',
+                               update=_upd_macro, description="ムラ1つぶんの大きさ")
+    bump_strength: FloatProperty(name="全体の凹凸", default=0.0, min=0.0, soft_max=2.0, subtype='FACTOR',
+                                 update=_upd_bump,
+                                 description="レイヤーを重ねた最終のハイトから凹凸を作って足す（苔が岩の上に盛り上がって見える）。0でなし")
+    bump_distance: FloatProperty(name="凹凸の高さ (m)", default=0.02, min=0.0001, soft_max=0.5, precision=3,
+                                 unit='LENGTH', update=_upd_bump, description="ハイトが 0→1 のとき、実際にどれだけ高さが違うか")
+    disp_strength: FloatProperty(name="動かす量 (m)", default=0.05, soft_min=-1.0, soft_max=1.0, precision=3,
+                                 unit='LENGTH', update=_upd_disp,
+                                 description="ハイトが 0→1 のとき、形をどれだけ動かすか（マイナスで逆向き）")
+    disp_mid: FloatProperty(name="中心の値", default=0.5, min=0.0, max=1.0, subtype='FACTOR', update=_upd_disp,
+                            description="この値のハイトでは形を動かさない。0.5なら、ハイトが高い所は外へ、低い所は内へ動く")
     # 焼き込み・書き出し
     use_baked: BoolProperty(name="焼き込んだ軽いマテリアルで表示", default=False, update=_upd_use_baked,
                             description="オンで焼き込んだテクスチャだけの軽いマテリアルに置き換える。オフでミキサーに戻る（設定はそのまま）")
@@ -3463,8 +4198,85 @@ class CMX_OT_bake_textures(_MixerOp, bpy.types.Operator):
                 img.pack()
             s.last_export = ""
         s.baked_material = build_baked_material(obj, images, uv)
+        s["cmx_bake_uv"] = uv        # ハイトで形を動かすとき、同じUVを使う
         s.use_baked = True
         self.report({'INFO'}, "%d 枚焼き込みました（%.1f 秒）%s" % (len(images), time.time() - t0, msg))
+        return {'FINISHED'}
+
+
+def height_image(obj):
+    """焼いたハイトの画像（なければ None）。"""
+    return bpy.data.images.get("CMX_%s_%s" % (obj.name, _BAKE_SUFFIX['HEIGHT']))
+
+
+def add_displace(obj):
+    """焼いたハイトで形を動かす Displace モディファイア（CMX_Displace）を付ける。失敗したときはメッセージを返す。"""
+    s = obj.cmx
+    img = height_image(obj)
+    if img is None:
+        return "先に「焼き込み」でハイトを焼いてください（焼くものの「ハイト」をオンに）"
+    uv = s.get("cmx_bake_uv", PAINT_UV)
+    if obj.data.uv_layers.get(uv) is None:
+        return "焼いたときのUVマップ（%s）がありません。焼き直してください" % uv
+    tname = "CMX_Disp_%s" % obj.name
+    tex = bpy.data.textures.get(tname) or bpy.data.textures.new(tname, 'IMAGE')
+    tex.image = img
+    md = obj.modifiers.get(DISP_MOD)
+    if md is None:
+        md = obj.modifiers.new(DISP_MOD, 'DISPLACE')
+    md.texture = tex
+    md.texture_coords = 'UV'
+    md.uv_layer = uv
+    md.direction = 'NORMAL'
+    md.strength = s.disp_strength
+    md.mid_level = s.disp_mid
+    md.show_viewport = True
+    md.show_render = True
+    # エッジ・くぼみの計算（CMX_Masks）より前に置く（スタックの最後はマスクの計算用）
+    mm = obj.modifiers.get(SM_MOD)
+    if mm is not None:
+        try:
+            obj.modifiers.move(list(obj.modifiers).index(md), list(obj.modifiers).index(mm))
+        except Exception:
+            pass
+    return None
+
+
+def remove_displace(obj):
+    md = obj.modifiers.get(DISP_MOD)
+    if md is not None:
+        obj.modifiers.remove(md)
+    tex = bpy.data.textures.get("CMX_Disp_%s" % obj.name)
+    if tex is not None and tex.users == 0:
+        bpy.data.textures.remove(tex)
+
+
+class CMX_OT_displace_add(_MixerOp, bpy.types.Operator):
+    bl_idname = "cmx.displace_add"
+    bl_label = "ハイトで形を動かす"
+    bl_description = ("焼き込んだハイトを使って、メッシュの形そのものを動かします（Displace モディファイア）。"
+                      "サブディビジョンなどで細かく分割してあると、きれいに出ます。焼き込み中は一時的に外れます")
+
+    def execute(self, context):
+        err = add_displace(_mixer_obj(context))
+        if err:
+            self.report({'WARNING'}, err)
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class CMX_OT_displace_remove(_MixerOp, bpy.types.Operator):
+    bl_idname = "cmx.displace_remove"
+    bl_label = "形の変形を外す"
+    bl_description = "ハイトで形を動かすモディファイア（CMX_Displace）を外す"
+
+    @classmethod
+    def poll(cls, context):
+        o = _mixer_obj(context)
+        return o is not None and o.modifiers.get(DISP_MOD) is not None
+
+    def execute(self, context):
+        remove_displace(_mixer_obj(context))
         return {'FINISHED'}
 
 
@@ -3925,6 +4737,146 @@ class CMX_PT_layer(_Sub, bpy.types.Panel):
             layout.label(text="ベース：一番下（全面）", icon=_icon('INFO'))
 
 
+AT_SAMPLE_WARN = 18      # Cycles のシェーダーの限界（SVM スタック）に近づく目安。四角 2 レイヤーのトリプラナーで超える
+
+
+def at_sample_count(s):
+    """タイリング崩しで、素材を読む回数（セルのサンプル数 × 投影の面数 を、レイヤーごとに足した合計）。"""
+    n = 0
+    for i, l in enumerate(s.layers):
+        if i > 0 and not (l.enabled and l.kind == 'MATERIAL'):
+            continue
+        if not l.anti_tile or l.material is None or not _has_images(l.material):
+            continue
+        if not s.tile_mode and l.projection == 'ORIGINAL':
+            continue
+        planes = 3 if (not s.tile_mode and l.projection == 'TRIPLANAR') else 1
+        n += planes * (3 if l.at_shape == 'HEX' else 4)
+    return n
+
+
+def _heavy_shader(s):
+    """Cycles のシェーダーの限界（SVM スタック）に近づきやすい構成か（タイリング崩しが多い・全体の凹凸がある）。
+    こういう構成でノーマルが真っ平らに焼けたら、失敗とみなす。"""
+    if at_sample_count(s) > AT_SAMPLE_WARN // 2:
+        return True
+    return s.bump_strength > 0.0 and any(l.material is not None and _has_images(l.material) for l in s.layers)
+
+
+def _placeable(context):
+    """配置・タイリング崩しを出せるレイヤーか（マテリアルを持つレイヤーで、「そのまま」投影ではない）。"""
+    obj, layer, i = _active_layer(context)
+    if layer is None or (i > 0 and layer.kind != 'MATERIAL') or layer.material is None:
+        return False
+    return obj.cmx.tile_mode or layer.projection != 'ORIGINAL'
+
+
+class CMX_PT_place(_Sub, bpy.types.Panel):
+    bl_label = "配置（ずらし・回転・繰り返し）"
+    bl_idname = "CMX_PT_place"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return _placeable(context)
+
+    def draw(self, context):
+        layout = self.layout
+        obj, layer, i = _active_layer(context)
+        s = obj.cmx
+        col = layout.column(align=True)
+        col.prop(layer, "place_x")
+        col.prop(layer, "place_y")
+        r = layout.row(align=True)
+        r.prop(layer, "place_rot")
+        r.prop(layer, "place_snap", toggle=True)
+        col = layout.column(align=True)
+        col.prop(layer, "place_sx")
+        col.prop(layer, "place_sy")
+        if s.tile_mode:
+            c = layout.column()
+            c.scale_y = 0.8
+            c.label(text="タイル素材：回転は 90° 刻み、繰り返しは整数回になります", icon=_icon('INFO'))
+
+
+class CMX_PT_relief(_Sub, bpy.types.Panel):
+    bl_label = "凹凸（ノーマル・ハイト）"
+    bl_idname = "CMX_PT_relief"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        obj, layer, i = _active_layer(context)
+        return layer is not None and (i == 0 or layer.kind == 'MATERIAL')
+
+    def draw(self, context):
+        layout = self.layout
+        obj, layer, i = _active_layer(context)
+        if layer.material is not None:
+            col = layout.column(align=True)
+            col.prop(layer, "normal_strength")
+            col.prop(layer, "height_strength_layer")
+            layout.prop(layer, "normal_flip_y")
+            layout.prop(layer, "normal_from_height")
+        else:
+            layout.prop(layer, "height_strength_layer")
+        layout.prop(layer, "height_invert")
+        if i > 0:
+            box = layout.box()
+            box.label(text="下のレイヤーとの重なり方", icon=_icon('MOD_DISPLACE'))
+            box.prop(layer, "stack_mode", text="")
+            if layer.stack_mode != 'NORMAL':
+                box.prop(layer, "stack_amount")
+            box.prop(layer, "wrap_amount")
+        c = layout.column()
+        c.scale_y = 0.8
+        c.label(text="全体の凹凸・形の変形は「全体の凹凸・ムラ」で", icon=_icon('INFO'))
+
+
+class CMX_PT_antitile(_Sub, bpy.types.Panel):
+    bl_label = "タイリング崩し"
+    bl_idname = "CMX_PT_antitile"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return _placeable(context)
+
+    def draw_header(self, context):
+        obj, layer, i = _active_layer(context)
+        if layer is not None:
+            self.layout.prop(layer, "anti_tile", text="")
+
+    def draw(self, context):
+        layout = self.layout
+        obj, layer, i = _active_layer(context)
+        s = obj.cmx
+        layout.active = layer.anti_tile
+        if not _has_images(layer.material):
+            c = layout.column()
+            c.scale_y = 0.8
+            c.label(text="この素材には画像テクスチャがないので効きません", icon=_icon('INFO'))
+        layout.prop(layer, "at_cell")
+        layout.row().prop(layer, "at_shape", expand=True)
+        layout.prop(layer, "at_rot")
+        layout.prop(layer, "at_flip")
+        col = layout.column(align=True)
+        col.prop(layer, "at_offset")
+        col.prop(layer, "at_blend")
+        layout.prop(layer, "at_mix")
+        layout.prop(layer, "at_seed")
+        c = layout.column()
+        c.scale_y = 0.8
+        if s.tile_mode:
+            c.label(text="タイル素材：セルは整数個、回転は 90° 刻みで継ぎ目なし", icon=_icon('INFO'))
+        else:
+            c.label(text="重くなります。塗っている間の簡易表示では使われません", icon=_icon('INFO'))
+        n = at_sample_count(s)
+        if n > AT_SAMPLE_WARN:
+            c.label(text="多すぎます（%d回読み込み）。焼き込み(Cycles)に失敗することがあります" % n, icon=_icon('ERROR'))
+            c.label(text="→ 六角形にする・トリプラナーをやめる・レイヤーを減らす")
+
+
 class CMX_PT_masks(_Sub, bpy.types.Panel):
     bl_label = "自動マスク"
     bl_idname = "CMX_PT_masks"
@@ -4069,6 +5021,48 @@ class CMX_PT_maskdata(_Sub, bpy.types.Panel):
                 layout.label(text=s.mask_image.name, icon=_icon('IMAGE_DATA'))
 
 
+class CMX_PT_global(_Sub, bpy.types.Panel):
+    bl_label = "全体の凹凸・ムラ"
+    bl_idname = "CMX_PT_global"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    @classmethod
+    def poll(cls, context):
+        return _mixer_obj(context) is not None
+
+    def draw(self, context):
+        layout = self.layout
+        obj = _mixer_obj(context)
+        s = obj.cmx
+        box = layout.box()
+        box.label(text="大きなムラ（繰り返し感を消す）", icon=_icon('MOD_NOISE'))
+        col = box.column(align=True)
+        col.prop(s, "macro_amount")
+        col.prop(s, "macro_scale")
+        box = layout.box()
+        box.label(text="全体の凹凸", icon=_icon('MOD_DISPLACE'))
+        col = box.column(align=True)
+        col.prop(s, "bump_strength")
+        col.prop(s, "bump_distance")
+        c = box.column()
+        c.scale_y = 0.8
+        c.label(text="重ねた最終のハイトから凹凸を作ります（焼き込みにも入る）")
+        box = layout.box()
+        box.label(text="ハイトで形を動かす", icon=_icon('MOD_DISPLACE'))
+        has = obj.modifiers.get(DISP_MOD) is not None
+        if has:
+            col = box.column(align=True)
+            col.prop(s, "disp_strength")
+            col.prop(s, "disp_mid")
+            box.operator("cmx.displace_remove", icon=_icon('X'))
+        else:
+            box.operator("cmx.displace_add", icon=_icon('MOD_DISPLACE'))
+            c = box.column()
+            c.scale_y = 0.8
+            c.label(text="先に「焼き込み」でハイトを焼いておく")
+            c.label(text="細かく分割した（サブディビジョン等）物向け")
+
+
 class CMX_PT_bake(_Sub, bpy.types.Panel):
     bl_label = "焼き込み・書き出し"
     bl_idname = "CMX_PT_bake"
@@ -4206,9 +5200,9 @@ classes = (CMX_Mask, CMX_Layer, CMX_MatRef, CMX_Settings, CMX_UL_layers, CMX_UL_
            CMX_OT_paint_layer, CMX_OT_paint_exit, CMX_OT_paint_mode, CMX_OT_fill, CMX_OT_rebuild,
            CMX_OT_mask_bake, CMX_OT_bake_textures, CMX_OT_open_export, CMX_OT_smart_save, CMX_OT_smart_apply,
            CMX_OT_smart_delete, CMX_OT_smart_open, CMX_OT_tile_create, CMX_OT_import_ground_paint,
-           CMX_OT_import_textures, CMX_FH_textures,
-           CMX_PT_main, CMX_PT_layer, CMX_PT_masks, CMX_PT_paint, CMX_PT_maskdata, CMX_PT_bake, CMX_PT_smart,
-           CMX_PT_settings)
+           CMX_OT_import_textures, CMX_FH_textures, CMX_OT_displace_add, CMX_OT_displace_remove,
+           CMX_PT_main, CMX_PT_layer, CMX_PT_place, CMX_PT_relief, CMX_PT_antitile, CMX_PT_masks, CMX_PT_paint,
+           CMX_PT_maskdata, CMX_PT_global, CMX_PT_bake, CMX_PT_smart, CMX_PT_settings)
 
 
 def _remove_handler(lst, fn):
