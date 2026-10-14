@@ -2801,13 +2801,65 @@ def assign_slots(obj):
     else:
         for slot in obj.material_slots:
             if slot.material != mat:
+                if obj.data.users > 1 and slot.link == 'DATA':
+                    slot.link = 'OBJECT'       # メッシュを共有している別の物（リンク複製）のマテリアルを書き換えないように
                 slot.material = mat
+
+
+def _is_shared(obj, mat):
+    """このマテリアルを、別の物のミキサーも使っているか（Shift+D で複製した直後など）。"""
+    return mat is not None and any(o.cmx.material == mat for o in bpy.data.objects if o is not obj)
+
+
+def _detach_shared(obj):
+    """複製した物が、元の物とマテリアル・塗り画像・マスク画像を共有していたら、自分用のコピーに切り離す
+    （共有したままだと、片方を変えるともう片方も変わってしまう）。"""
+    s = obj.cmx
+    others = [o for o in bpy.data.objects if o is not obj]
+    mat = s.material
+    if mat is not None and any(o.cmx.material == mat for o in others):
+        new = mat.copy()
+        new.name = "CMX_%s" % obj.name
+        s.material = new
+    bm = s.baked_material
+    if bm is not None and any(o.cmx.baked_material == bm for o in others):
+        # 焼いた画像は元の物の名前で上書きされるので、共有したままにしない（ミキサー表示に戻す）
+        _SUSPEND[0] += 1
+        try:
+            s.baked_material = None
+            s.use_baked = False
+        finally:
+            _SUSPEND[0] -= 1
+    mi = s.mask_image
+    if mi is not None and any(o.cmx.mask_image == mi for o in others):
+        img = mi.copy()
+        img.name = "CMX_%s_Masks" % obj.name
+        try:
+            img.pack()
+        except Exception:
+            pass
+        _SUSPEND[0] += 1
+        try:
+            s.mask_image = img
+        finally:
+            _SUSPEND[0] -= 1
+    used = {l.image.as_pointer() for o in others for l in o.cmx.layers if l.image is not None}
+    for l in s.layers:
+        if l.image is not None and l.image.as_pointer() in used:
+            img = l.image.copy()
+            img.name = "CMX_%s_%s" % (obj.name, l.uid)
+            try:
+                img.pack()
+            except Exception:
+                pass
+            l.image = img
 
 
 def rebuild_material(obj, light=None):
     s = obj.cmx
     if light is None:
         light = _want_light(obj)
+    _detach_shared(obj)
     mat = s.material
     if mat is None:
         mat = bpy.data.materials.new("CMX_%s" % obj.name)
@@ -3044,6 +3096,9 @@ def _mask_index(mask):
 
 def _node(obj, name):
     mat = obj.cmx.material
+    if mat is not None and not _SUSPEND[0] and _is_shared(obj, mat):
+        rebuild_material(obj)           # 複製直後は、まず自分用に切り離す（元の物を巻き込まない）
+        mat = obj.cmx.material
     if mat is not None and mat.node_tree is not None:
         return mat.node_tree.nodes.get(name)
     return None
